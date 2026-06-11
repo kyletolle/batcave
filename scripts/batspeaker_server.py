@@ -17,7 +17,7 @@ entry always exist by the time we emit an event. No race.
 import sys, os, re, json, time, socket, argparse, tempfile, subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VAULT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+VAULT = os.environ.get("BATSPEAKER_VAULT") or os.path.expanduser("~/vault")
 MP3_DIR = os.path.join(VAULT, "3 Information", "Attachments", "batspeaker")
 NOTE = os.path.join(VAULT, "0 Inbox", "Bat-Speaker Live.md")
 LOG = os.path.expanduser("~/.local/state/batspeaker.jsonl")

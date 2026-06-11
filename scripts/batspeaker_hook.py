@@ -14,7 +14,7 @@ and the slow work runs in a detached child process.
 """
 import sys, os, json, re, subprocess, time, glob, traceback
 
-VAULT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+VAULT = os.environ.get("BATSPEAKER_VAULT") or os.path.expanduser("~/vault")
 TOGGLE = os.path.expanduser("~/.batspeaker-on")
 MP3_DIR = os.path.join(VAULT, "3 Information", "Attachments", "batspeaker")
 NOTE = os.path.join(VAULT, "0 Inbox", "Bat-Speaker Live.md")
