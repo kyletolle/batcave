@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 source ~/.env.sh
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-bash "$SCRIPT_DIR/moshi-notify.sh" "$@"
+bash "$SCRIPT_DIR/../vps/moshi-notify.sh" "$@"

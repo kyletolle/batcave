@@ -210,7 +210,7 @@ def format_task(t, pmap, show_recurring=True):
 
 # --- Audit log ---
 
-AUDIT_LOG = Path(__file__).parent / "todoist_audit.jsonl"
+AUDIT_LOG = Path.home() / "vault" / "3 Information" / "Scripts" / "todoist_audit.jsonl"
 AUDIT_MAX_BYTES = 5 * 1024 * 1024  # rotate once the log crosses 5 MB
 AUDIT_KEEP = 3                     # keep todoist_audit.jsonl.1 .. .3
 

@@ -23,7 +23,7 @@ import urllib.error
 API = "https://readwise.io/api/v3"
 TOKEN = os.environ.get("READWISE_TOKEN")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR = os.path.join(SCRIPT_DIR, "cleanup_buckets")
+OUT_DIR = os.path.expanduser("~/vault/3 Information/Scripts/cleanup_buckets")
 
 
 def die(m):

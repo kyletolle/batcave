@@ -1,7 +1,7 @@
 """Regression tests for sleep_duration.py.
 
 Run from vault root:
-    python3 -m pytest "3 Information/Scripts/tests/" -v
+    python3 -m pytest scripts/tests/ -v
 """
 
 import json

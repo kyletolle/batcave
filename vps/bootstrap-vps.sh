@@ -24,8 +24,8 @@
 #  10. Copies memory and session logs from old server (if provided)
 #
 # Usage:
-#   bash "3 Information/Scripts/bootstrap-vps.sh"
-#   bash "3 Information/Scripts/bootstrap-vps.sh" --from bruce-vps-old   # migrate from old server
+#   bash "$HOME/projects/batcave/vps/bootstrap-vps.sh"
+#   bash "$HOME/projects/batcave/vps/bootstrap-vps.sh" --from bruce-vps-old   # migrate from old server
 #
 # This script is idempotent — safe to re-run.
 #
@@ -37,6 +37,7 @@ set -euo pipefail
 
 VAULT_DIR="$HOME/vault"
 SCRIPT_DIR="$VAULT_DIR/3 Information/Scripts"
+REPO_DIR="$HOME/projects/batcave"   # clone of github.com/kyletolle/batcave
 WRAPPER_DIR="$HOME/.local/bin"
 CLAUDE_DIR="$HOME/.claude"
 CLAUDE_PROJECT_DIR="$CLAUDE_DIR/projects/-home-kyle-vault"
@@ -138,23 +139,23 @@ echo ""
 echo "[3/11] Setting up CLI wrapper symlinks..."
 mkdir -p "$WRAPPER_DIR"
 
-# Map of wrapper name → script path (relative to vault)
+# Map of wrapper name → script path (relative to the batcave repo)
 declare -A WRAPPERS=(
-  [todoist]="3 Information/Scripts/todoist"
-  [send-to-readwise]="3 Information/Scripts/send-to-readwise"
-  [claude-start]="3 Information/Scripts/claude-start"
-  [extract-session]="3 Information/Scripts/extract-session"
-  [llm-panel]="3 Information/Scripts/llm-panel"
-  [qmd-receive]="3 Information/Scripts/qmd-receive"
-  [qmd-update]="3 Information/Scripts/qmd-update"
-  [tts]="3 Information/Scripts/tts.sh"
-  [read-aloud]="3 Information/Scripts/read-aloud"
-  [daily-read-aloud]="3 Information/Scripts/daily-read-aloud"
-  [ccusage-log]="3 Information/Scripts/ccusage_daily_log.sh"
+  [todoist]="bin/todoist"
+  [send-to-readwise]="bin/send-to-readwise"
+  [claude-start]="bin/claude-start"
+  [extract-session]="bin/extract-session"
+  [llm-panel]="bin/llm-panel"
+  [qmd-receive]="bin/qmd-receive"
+  [qmd-update]="bin/qmd-update"
+  [tts]="scripts/tts.sh"
+  [read-aloud]="bin/read-aloud"
+  [daily-read-aloud]="bin/daily-read-aloud"
+  [ccusage-log]="vps/ccusage_daily_log.sh"
 )
 
 for name in "${!WRAPPERS[@]}"; do
-  target="$VAULT_DIR/${WRAPPERS[$name]}"
+  target="$REPO_DIR/${WRAPPERS[$name]}"
   link="$WRAPPER_DIR/$name"
   if [[ -L "$link" ]]; then
     echo "  $name → already linked"
@@ -171,8 +172,8 @@ echo ""
 
 # --- Step 4: Cron jobs ---
 echo "[4/11] Setting up cron jobs..."
-CCUSAGE_LINE='0 1 * * * /bin/bash "$HOME/vault/3 Information/Scripts/ccusage_daily_log.sh" >> "$HOME/vault/3 Information/Scripts/ccusage_cron.log" 2>&1'
-DISK_WATCH_LINE='30 8 * * * /bin/bash "$HOME/vault/3 Information/Scripts/disk-watch.sh"'
+CCUSAGE_LINE='0 1 * * * /bin/bash "$HOME/projects/batcave/vps/ccusage_daily_log.sh" >> "$HOME/vault/3 Information/Scripts/ccusage_cron.log" 2>&1'
+DISK_WATCH_LINE='30 8 * * * /bin/bash "$HOME/projects/batcave/vps/disk-watch.sh"'
 
 if crontab -l 2>/dev/null | grep -q "ccusage_daily_log"; then
   echo "ccusage cron job already exists."
@@ -248,7 +249,7 @@ echo ""
 
 # --- Step 6: Patch QMD reranker for CPU-only systems ---
 echo "[6/11] Patching QMD reranker (issue #68 workaround)..."
-PATCH_SCRIPT="$VAULT_DIR/3 Information/Scripts/patch-qmd-reranker.sh"
+PATCH_SCRIPT="$REPO_DIR/scripts/patch-qmd-reranker.sh"
 if [[ -f "$PATCH_SCRIPT" ]]; then
   bash "$PATCH_SCRIPT"
 else
@@ -524,7 +525,7 @@ echo ""
 echo "  Next steps:"
 echo "    1. Start Claude Code: tmux new -s claude && claude-start"
 echo "    2. Verify QMD: qmd status"
-echo "    3. Run ccusage backfill: bash \"3 Information/Scripts/ccusage_daily_log.sh\" --backfill"
+echo "    3. Run ccusage backfill: bash \"$HOME/projects/batcave/vps/ccusage_daily_log.sh\" --backfill"
 echo "    4. Pair moshi-hook (if not already paired):"
 echo "         moshi-hook pair --token <YOUR_TOKEN>  # token from Moshi app Settings"
 echo "         moshi-hook install"

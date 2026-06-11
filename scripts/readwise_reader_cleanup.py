@@ -41,7 +41,7 @@ ALLOWLIST_TAGS = {"morning-brief", "weekly-review", "sovereignty"}
 ALLOWED_CATEGORY = "article"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Audit log: durable, in-vault, alongside todoist_audit.jsonl precedent.
-AUDIT_PATH = os.path.join(SCRIPT_DIR, "readwise_cleanup_audit.jsonl")
+AUDIT_PATH = os.path.expanduser("~/vault/3 Information/Scripts/readwise_cleanup_audit.jsonl")
 # Highlight cache: durable + private + out-of-vault (regenerable; holds highlight text).
 DATA_DIR = os.path.expanduser("~/.local/share/readwise-cleanup")
 HL_CACHE = os.path.join(DATA_DIR, "highlights_cache.json")

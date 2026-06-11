@@ -3,4 +3,4 @@
 # then delegates. Pass through all args (--limit, --file, --dry-run, --resume, --output).
 source ~/.env.sh
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-exec python3 "$SCRIPT_DIR/shard_gardens_audit.py" "$@"
+exec python3 "$SCRIPT_DIR/../scripts/shard_gardens_audit.py" "$@"

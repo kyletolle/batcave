@@ -9,8 +9,8 @@ set -euo pipefail
 TOGGLE="$HOME/.batspeaker-on"
 JLOG="$HOME/.local/state/batspeaker.jsonl"
 CONFIG="$HOME/.config/batspeaker/config.json"
-HOOK="/home/kyle/vault/3 Information/Scripts/batspeaker_hook.py"
-SERVER="/home/kyle/vault/3 Information/Scripts/batspeaker_server.py"
+HOOK="/home/kyle/projects/batcave/scripts/batspeaker_hook.py"
+SERVER="/home/kyle/projects/batcave/scripts/batspeaker_server.py"
 
 case "${1:-status}" in
   serve)  shift || true; exec python3 "$SERVER" "$@" ;;

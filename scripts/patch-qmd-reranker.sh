@@ -11,7 +11,7 @@
 # Run this after `bun install -g @tobilu/qmd` or any QMD upgrade.
 # Remove this script entirely when upstream fixes issue #68.
 #
-# Usage: bash "3 Information/Scripts/patch-qmd-reranker.sh"
+# Usage: bash "~/projects/batcave/scripts/patch-qmd-reranker.sh"
 
 set -euo pipefail
 

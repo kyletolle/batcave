@@ -11,7 +11,7 @@ lines in the doc (mutable) and returns a count of line-level modifications,
 so stdout gives Kyle a rule-by-rule scoreboard.
 
 Run:
-    python3 "3 Information/Scripts/apply_taxonomy_v2.py"
+    python3 "~/projects/batcave/scripts/apply_taxonomy_v2.py"
 
 No arguments. Paths are hardcoded; edit the CONSTANTS block below if needed.
 """
@@ -374,7 +374,7 @@ def build_v2_preamble(rule_results: List[Tuple[str, int]]) -> str:
         "",
         "Nine Suggestions-pass rules plus two taxonomy amendments from "
         "[[Taxonomy Adoption Preview Apr 2026]] §6, applied mechanically by "
-        "`3 Information/Scripts/apply_taxonomy_v2.py`. Per-rule change counts below. "
+        "`batcave/scripts/apply_taxonomy_v2.py`. Per-rule change counts below. "
         "Every resulting tag validated against the v2 taxonomy leaf set (61 leaves).",
         "",
     ]

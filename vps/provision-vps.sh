@@ -9,7 +9,7 @@
 # 5. Copy the setup script to the server
 # 6. Print next steps
 #
-# Usage: bash "3 Information/Scripts/provision-vps.sh" [--location nbg1] [--name bruce-vps] [--tailscale-key tskey-auth-...]
+# Usage: bash "vps/provision-vps.sh" [--location nbg1] [--name bruce-vps] [--tailscale-key tskey-auth-...]
 
 set -euo pipefail
 
