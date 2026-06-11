@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+source ~/.env.sh
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+export VAULT_PATH="$HOME/vault"
+exec python3 "$SCRIPT_DIR/llm_panel.py" "$@"

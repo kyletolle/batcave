@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec python3 "/home/kyle/vault/3 Information/Scripts/sleep_duration.py" "$@"

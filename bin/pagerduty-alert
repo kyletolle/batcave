@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Send a PagerDuty alert via Events API v2.
+# Usage: pagerduty-alert "Summary" [severity] [source]
+#   severity: critical (default), error, warning, info
+#   source: hostname (default)
+
+set -euo pipefail
+
+[[ -f "$HOME/.env.sh" ]] && source "$HOME/.env.sh"
+
+if [[ -z "${PAGER_DUTY_API_KEY:-}" ]]; then
+    echo "Error: PAGER_DUTY_API_KEY not set." >&2
+    exit 1
+fi
+
+SUMMARY="${1:-Alert from $(hostname)}"
+SEVERITY="${2:-critical}"
+SOURCE="${3:-$(hostname)}"
+
+RESPONSE=$(curl -s --request POST \
+    --url 'https://events.pagerduty.com/v2/enqueue' \
+    --header 'Content-Type: application/json' \
+    --data "$(jq -n \
+        --arg summary "$SUMMARY" \
+        --arg severity "$SEVERITY" \
+        --arg source "$SOURCE" \
+        --arg key "$PAGER_DUTY_API_KEY" \
+        '{payload: {summary: $summary, severity: $severity, source: $source}, routing_key: $key, event_action: "trigger"}')")
+
+if echo "$RESPONSE" | jq -e '.status == "success"' > /dev/null 2>&1; then
+    echo "PagerDuty: $SUMMARY"
+else
+    echo "PagerDuty failed: $RESPONSE" >&2
+    exit 1
+fi

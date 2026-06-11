@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+source ~/.env.sh
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+python3 "$SCRIPT_DIR/todoist.py" "$@"

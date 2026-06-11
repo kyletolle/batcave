@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Wrapper for `qmd mcp` invoked by Claude Code plugin stdio transport.
+#
+# Forces CPU execution. QMD calls getLlama({gpu: "auto"}) by default, which
+# overrides node-llama-cpp's NODE_LLAMA_CPP_GPU env var. The QMD-specific
+# QMD_LLAMA_GPU env var is the only thing that prevents the Vulkan/CMake
+# build attempt on first vec/hyde query. Without this, the build's CMake
+# output writes to stdout, corrupting the JSON-RPC channel and disconnecting
+# Claude Code's MCP client.
+#
+# See: 0 Inbox/The Batcave/QMD — MCP Reliability Tracker.md (2026-05-10 incident)
+
+export QMD_LLAMA_GPU=false
+export NODE_LLAMA_CPP_GPU=false  # belt-and-suspenders: silences node-llama-cpp's auto path
+
+exec qmd mcp "$@"

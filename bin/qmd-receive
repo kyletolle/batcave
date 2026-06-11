@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# qmd-receive — Prepare for and finalize QMD index transfers from WSL
+#
+# The full SCP cycle from WSL:
+#   ssh kyle@bruce-vps "qmd-receive prep"
+#   scp ~/.cache/qmd/index.sqlite kyle@bruce-vps:~/.cache/qmd/index.sqlite
+#   ssh kyle@bruce-vps "qmd-receive finish"
+#
+# Or interactively on VPS:
+#   qmd-receive           (runs prep, waits for you to SCP, then finish)
+#   qmd-receive prep      (stop services, clean old files)
+#   qmd-receive finish    (clean WAL, restart services, verify)
+
+INDEX="$HOME/.cache/qmd/index.sqlite"
+
+prep() {
+    echo "=== QMD Receive: Prep ==="
+    echo "Stopping qmd-mcp.service..."
+    systemctl --user stop qmd-mcp.service 2>/dev/null || true
+    echo "Stopping qmd-embed.timer..."
+    systemctl --user stop qmd-embed.timer 2>/dev/null || true
+
+    # Clean old index files (WAL/SHM cause corruption on SCP overwrite)
+    echo "Cleaning old index files..."
+    rm -f "${INDEX}" "${INDEX}-wal" "${INDEX}-shm"
+
+    echo "Ready for SCP. Target: ${INDEX}"
+}
+
+finish() {
+    echo "=== QMD Receive: Finish ==="
+
+    if [ ! -f "$INDEX" ]; then
+        echo "ERROR: No index file at ${INDEX}. Did the SCP complete?"
+        exit 1
+    fi
+
+    # Clean any WAL/SHM that snuck in
+    rm -f "${INDEX}-wal" "${INDEX}-shm"
+
+    # Verify integrity
+    echo "Checking integrity..."
+    result=$(sqlite3 "$INDEX" "PRAGMA integrity_check;" 2>&1)
+    if [ "$result" != "ok" ]; then
+        echo "ERROR: Index failed integrity check:"
+        echo "$result" | head -5
+        exit 1
+    fi
+    echo "Integrity: ok"
+
+    # Verify collections
+    echo ""
+    echo "Collections:"
+    qmd collection list 2>&1
+    echo ""
+
+    # Restart services
+    echo "Starting qmd-mcp.service..."
+    systemctl --user start qmd-mcp.service
+    echo "Starting qmd-embed.timer..."
+    systemctl --user start qmd-embed.timer
+
+    # Quick search sanity check
+    echo ""
+    echo "Sanity check (keyword search: 'Bruhemiphance'):"
+    qmd search "Bruhemiphance" -n 3 --files 2>&1 || echo "(search returned no results)"
+
+    echo ""
+    echo "Done. QMD ready."
+}
+
+case "${1:-interactive}" in
+    prep)
+        prep
+        ;;
+    finish)
+        finish
+        ;;
+    interactive)
+        prep
+        echo ""
+        echo "SCP the index now, then press Enter to continue..."
+        read -r
+        finish
+        ;;
+    *)
+        echo "Usage: qmd-receive [prep|finish]"
+        echo "  prep     Stop services, clean old files (before SCP)"
+        echo "  finish   Clean WAL, restart services, verify (after SCP)"
+        echo "  (none)   Interactive: prep, wait, finish"
+        exit 1
+        ;;
+esac

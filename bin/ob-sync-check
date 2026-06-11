@@ -1,0 +1,26 @@
+#!/bin/bash
+# Check that ob-sync is actively syncing via journal heartbeats.
+# ob-sync logs "Fully synced" every ~30s when connected. A gap longer than
+# WINDOW_HOURS means the connection is dead or stuck.
+#
+# Run hourly via ob-sync-check.timer. Alerts via moshi.
+
+WINDOW_HOURS=2
+
+# Count "Fully synced" events in the lookback window
+recent_count=$(journalctl -u ob-sync.service --since "${WINDOW_HOURS} hours ago" \
+    --no-pager -q 2>/dev/null | grep -c "Fully synced" || echo 0)
+
+if [ "$recent_count" -eq 0 ]; then
+    if ! systemctl is-active --quiet ob-sync.service 2>/dev/null; then
+        moshi "ob-sync Alert" "ob-sync.service is not running — Obsidian Sync is down."
+    else
+        moshi "ob-sync Alert" "ob-sync running but no heartbeat in ${WINDOW_HOURS}h — connection may be stuck."
+    fi
+fi
+
+# Optional: ping healthchecks.io on success (set HEALTHCHECKS_OBSYNC_URL in ~/.env.sh)
+source "$HOME/.env.sh" 2>/dev/null || true
+if [ -n "$HEALTHCHECKS_OBSYNC_URL" ] && [ "$recent_count" -gt 0 ]; then
+    curl -fsS -m 10 "$HEALTHCHECKS_OBSYNC_URL" > /dev/null 2>&1 || true
+fi

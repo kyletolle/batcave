@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# qmd-query — CLI wrapper for QMD search, usable from Claude Code Bash tool
+# Bypasses flaky MCP plugin. Uses BM25 keyword search (no model loading).
+#
+# Usage:
+#   qmd-query "search terms"                  # BM25 keyword search
+#   qmd-query "search terms" --limit 10       # control result count (default 5)
+#   qmd-query get path/to/file.md             # retrieve a document
+#   qmd-query get path/to/file.md:100         # retrieve from line offset
+#   qmd-query multi-get "glob/pattern*.md"    # batch retrieve
+
+set -euo pipefail
+export NODE_LLAMA_CPP_GPU=false
+
+cmd="${1:-}"
+
+if [[ -z "$cmd" ]]; then
+    echo "Usage: qmd-query <search terms> [--limit N]"
+    echo "       qmd-query get <file[:line]>"
+    echo "       qmd-query multi-get <pattern>"
+    exit 1
+fi
+
+case "$cmd" in
+    get)
+        shift
+        qmd get "$@"
+        ;;
+    multi-get)
+        shift
+        qmd multi-get "$@"
+        ;;
+    *)
+        # Search mode — collect args
+        limit=5
+        terms=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --limit|-l)
+                    limit="$2"
+                    shift 2
+                    ;;
+                *)
+                    terms+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        qmd search "${terms[*]}" --limit "$limit"
+        ;;
+esac

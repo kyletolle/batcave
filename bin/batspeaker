@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Toggle / inspect / configure the Bat-Speaker Stop hook (auto-TTS of Bruce).
+# Usage:
+#   batspeaker on | off | status
+#   batspeaker log [N]
+#   batspeaker config              # show current config
+#   batspeaker set KEY VALUE       # e.g. batspeaker set voice nova
+set -euo pipefail
+TOGGLE="$HOME/.batspeaker-on"
+JLOG="$HOME/.local/state/batspeaker.jsonl"
+CONFIG="$HOME/.config/batspeaker/config.json"
+HOOK="/home/kyle/vault/3 Information/Scripts/batspeaker_hook.py"
+SERVER="/home/kyle/vault/3 Information/Scripts/batspeaker_server.py"
+
+case "${1:-status}" in
+  serve)  shift || true; exec python3 "$SERVER" "$@" ;;
+  last)   N="${2:-1}"; exec python3 "$HOOK" --last "$N" ;;
+  stats)  exec python3 "$HOOK" --stats ;;
+  clear)  exec python3 "$HOOK" --clear ;;
+  on)     touch "$TOGGLE";  echo "🔊 Bat-Speaker ON — responses will be spoken into the vault." ;;
+  off)    rm -f "$TOGGLE";  echo "🔇 Bat-Speaker OFF." ;;
+  status) [ -f "$TOGGLE" ] && echo "🔊 Bat-Speaker is ON." || echo "🔇 Bat-Speaker is OFF." ;;
+  log)    N="${2:-20}"
+          [ -f "$JLOG" ] || { echo "(no log yet at $JLOG)"; exit 0; }
+          if command -v jq >/dev/null 2>&1; then
+            tail -n "$N" "$JLOG" | jq -c '{ts,event,status,reason,stage,attempts,mp3,chars,duration,error}'
+          else
+            tail -n "$N" "$JLOG"
+          fi ;;
+  config) [ -f "$CONFIG" ] && cat "$CONFIG" || echo "(no config; using built-in defaults)" ;;
+  set)    KEY="${2:?key required}"; VALUE="${3:?value required}"
+          python3 - "$CONFIG" "$KEY" "$VALUE" <<'PY'
+import json, os, sys
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+cfg = {}
+if os.path.exists(path):
+    try: cfg = json.load(open(path))
+    except Exception: cfg = {}
+# coerce types: bool / int / leave string
+low = val.lower()
+if low in ("true", "false"):
+    cfg[key] = (low == "true")
+else:
+    try:
+        cfg[key] = int(val)
+    except ValueError:
+        cfg[key] = val
+json.dump(cfg, open(path, "w"), indent=2, ensure_ascii=False)
+print(f"set {key} = {cfg[key]!r}")
+print(json.dumps(cfg, indent=2, ensure_ascii=False))
+PY
+          ;;
+  *)      echo "Usage: batspeaker on|off|status | serve [--port N] | last [N] | clear | stats | log [N] | config | set KEY VALUE" >&2; exit 1 ;;
+esac

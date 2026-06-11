@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Read Aloud — Convert articles, feeds, or ebooks to audio via TTS
+# Wrapper that sources env and calls the Python script
+set -euo pipefail
+SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+source ~/.env.sh
+exec python3 "$SCRIPT_DIR/read_aloud.py" "$@"

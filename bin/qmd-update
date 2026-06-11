@@ -1,0 +1,60 @@
+#!/bin/bash
+# QMD index update + embed with timing instrumentation
+# Called by systemd timer (qmd-embed.timer)
+
+LOG_FILE="$HOME/.cache/qmd/update.log"
+MAX_LOG_LINES=500
+
+start=$(date +%s%N)
+timestamp=$(date -Iseconds)
+
+# Guard: collections can be silently wiped by bun upgrades. Without them,
+# every run is a no-op and the index freezes. Catch this immediately.
+collection_check=$(qmd collection list 2>&1)
+if echo "$collection_check" | grep -q "No collections found"; then
+    logger -t qmd-update "No collections registered — index is frozen. Run: qmd-collection-add"
+    echo "qmd-update: No collections registered — index is frozen. Run: qmd-collection-add" >&2
+    echo "${timestamp} update=0ms embed=0ms total=0ms action=ERROR:no-collections" >> "$LOG_FILE"
+    exit 1
+fi
+
+# Update collections (scan for changed files)
+update_start=$(date +%s%N)
+update_output=$(qmd update 2>&1)
+update_rc=$?
+update_ms=$(( ($(date +%s%N) - update_start) / 1000000 ))
+
+# Run embed
+embed_start=$(date +%s%N)
+embed_output=$(qmd embed 2>&1)
+embed_rc=$?
+embed_ms=$(( ($(date +%s%N) - embed_start) / 1000000 ))
+
+total_ms=$(( ($(date +%s%N) - start) / 1000000 ))
+
+# Determine if anything actually happened
+if echo "$embed_output" | grep -q "All content hashes already have embeddings"; then
+    action="no-op"
+elif echo "$embed_output" | grep -q "Embedded"; then
+    chunks=$(echo "$embed_output" | grep -oP 'Embedded \K[0-9]+')
+    docs=$(echo "$embed_output" | grep -oP 'from \K[0-9]+')
+    action="embedded ${chunks} chunks from ${docs} docs"
+else
+    action="unknown"
+fi
+
+# Log one line per run
+echo "${timestamp} update=${update_ms}ms embed=${embed_ms}ms total=${total_ms}ms action=${action}" >> "$LOG_FILE"
+
+# Trim log if it gets too long
+if [ "$(wc -l < "$LOG_FILE" 2>/dev/null)" -gt "$MAX_LOG_LINES" ]; then
+    tail -n "$MAX_LOG_LINES" "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+fi
+
+# Optional: ping healthchecks.io on success (set HEALTHCHECKS_QMD_URL in ~/.env.sh)
+source "$HOME/.env.sh" 2>/dev/null || true
+if [ -n "$HEALTHCHECKS_QMD_URL" ]; then
+    curl -fsS -m 10 "$HEALTHCHECKS_QMD_URL" > /dev/null 2>&1 || true
+fi
+
+exit 0

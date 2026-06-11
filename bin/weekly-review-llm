@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source ~/.env.sh
+
+VAULT="${VAULT_PATH:-$HOME/vault}"
+SCRIPTS="$VAULT/3 Information/Scripts"
+
+# First arg: optional week in YYYY-WXX format (e.g. 2026-W17). Auto-detect if omitted.
+if [[ "${1:-}" =~ ^[0-9]{4}-W[0-9]{2}$ ]]; then
+    WEEK="$1"
+    shift
+else
+    WEEK=$(python3 -c "from datetime import date; d = date.today(); print(f'{d.isocalendar().year}-W{d.isocalendar().week:02d}')")
+fi
+
+BAKED="$VAULT/4 Time/Weekly Review/$WEEK Weekly Review EasyBake.baked.md"
+AI_NOTE="$VAULT/4 Time/Weekly Review/$WEEK AI.md"
+
+exec python3 "$SCRIPTS/weekly_review_llm.py" "$BAKED" "$AI_NOTE" "$@"

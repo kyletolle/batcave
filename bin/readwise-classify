@@ -1,0 +1,5 @@
+#!/bin/bash
+# Classify Readwise Reader documents by topic
+# Usage: readwise-classify [--all] [--preview] [--stats]
+source ~/.env.sh
+python3 ~/vault/"3 Information/Scripts/readwise_classify.py" "$@"

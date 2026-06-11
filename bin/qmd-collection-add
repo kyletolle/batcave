@@ -1,0 +1,19 @@
+#!/bin/bash
+# Re-register all 6 QMD collections on the VPS.
+# Run after any bun install -g @tobilu/qmd upgrade — upgrades wipe collection
+# registrations from SQLite. The embed timer becomes a silent no-op without them.
+
+set -e
+
+echo "Registering QMD collections..."
+
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/0\ Inbox/The\ Batcave --name batcave
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/0\ Inbox --name inbox --ignore "The Batcave/**"
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/2\ Ideas --name ideas
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/4\ Time --name time
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/5\ Completed --name completed
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/1\ Projects/Bones\ of\ a\ Broken\ World --name boabw
+
+echo ""
+echo "Collections registered. Embed timer will process backlog automatically."
+echo "Watch progress: tail -f ~/.cache/qmd/update.log"

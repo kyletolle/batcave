@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+source ~/.env.sh
+cd ~/vault
+
+# Kill orphan Telegram plugin processes from previous sessions
+# (only one bot polling connection allowed; orphans steal messages)
+pkill -f "external_plugins/telegram.*start" 2>/dev/null
+pkill -f "cache/claude-plugins-official/telegram.*start" 2>/dev/null
+
+claude "$@"

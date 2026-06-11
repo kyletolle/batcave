@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.jsonl
+*.log
+*.mp3
+data/
+.env
+.env.sh
