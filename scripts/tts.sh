@@ -66,33 +66,73 @@ if [ -z "$TEXT" ]; then
     exit 1
 fi
 
-# OpenAI TTS has a 4096 character limit per request
-if [ "${#TEXT}" -gt 4096 ]; then
-    echo "Warning: text is ${#TEXT} chars (limit 4096). Truncating." >&2
-    TEXT="${TEXT:0:4096}"
-fi
-
 # Default output path
 if [ -z "$OUTPUT" ]; then
     OUTPUT="/tmp/bruce_tts_$(date +%s).mp3"
 fi
 
-# Generate audio
-HTTP_CODE=$(curl -s -w "%{http_code}" https://api.openai.com/v1/audio/speech \
-    -H "Authorization: Bearer $OPENAI_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n --arg model "$MODEL" --arg voice "$VOICE" --arg input "$TEXT" --argjson speed "$SPEED" \
-        '{model: $model, input: $input, voice: $voice, speed: $speed}')" \
-    --output "$OUTPUT")
-
-if [ "$HTTP_CODE" -ne 200 ]; then
-    echo "Error: API returned HTTP $HTTP_CODE" >&2
-    # Output file might contain error JSON
-    if [ -f "$OUTPUT" ]; then
-        cat "$OUTPUT" >&2
-        rm -f "$OUTPUT"
+# One OpenAI TTS request -> mp3 file. Exits non-zero on API error.
+synth_one() {
+    local text="$1" out="$2" code
+    code=$(curl -s -w "%{http_code}" https://api.openai.com/v1/audio/speech \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg model "$MODEL" --arg voice "$VOICE" --arg input "$text" --argjson speed "$SPEED" \
+            '{model: $model, input: $input, voice: $voice, speed: $speed}')" \
+        --output "$out")
+    if [ "$code" -ne 200 ]; then
+        echo "Error: API returned HTTP $code" >&2
+        if [ -f "$out" ]; then cat "$out" >&2; rm -f "$out"; fi
+        exit 1
     fi
-    exit 1
+}
+
+# OpenAI caps each request at 4096 chars. Past that, chunk on paragraph/
+# sentence boundaries and concat the parts rather than truncating the text.
+LIMIT=3900
+if [ "${#TEXT}" -le "$LIMIT" ]; then
+    synth_one "$TEXT" "$OUTPUT"
+else
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo "Error: text is ${#TEXT} chars (>$LIMIT); ffmpeg is required to concat chunks." >&2
+        exit 1
+    fi
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+    N=$(printf '%s' "$TEXT" | python3 -c '
+import sys, re, os
+text = sys.stdin.read()
+limit, outdir = int(sys.argv[1]), sys.argv[2]
+chunks, cur = [], ""
+for para in re.split(r"(\n\n+)", text):
+    if len(cur) + len(para) <= limit:
+        cur += para
+    elif len(para) <= limit:
+        if cur.strip(): chunks.append(cur)
+        cur = para
+    else:
+        for sent in re.split(r"(?<=[.!?])\s+", para):
+            if len(cur) + len(sent) + 1 <= limit:
+                cur += ((" " if cur else "") + sent)
+            else:
+                if cur.strip(): chunks.append(cur)
+                cur = sent
+if cur.strip(): chunks.append(cur)
+chunks = [c for c in chunks if c.strip()]
+for i, c in enumerate(chunks):
+    with open(os.path.join(outdir, "chunk_%03d.txt" % i), "w") as f:
+        f.write(c)
+print(len(chunks))
+' "$LIMIT" "$WORK")
+    LIST="$WORK/list.txt"
+    : > "$LIST"
+    for cf in "$WORK"/chunk_*.txt; do
+        part="${cf%.txt}.mp3"
+        synth_one "$(cat "$cf")" "$part"
+        echo "file '$part'" >> "$LIST"
+    done
+    ffmpeg -y -f concat -safe 0 -i "$LIST" -c copy "$OUTPUT" >/dev/null 2>&1
+    echo "Chunked ${#TEXT} chars into ${N} parts." >&2
 fi
 
 SIZE=$(stat -c%s "$OUTPUT" 2>/dev/null || stat -f%z "$OUTPUT" 2>/dev/null)
