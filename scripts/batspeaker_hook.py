@@ -382,15 +382,40 @@ def synth_elevenlabs(text, voice_id, model_id, out):
         f.write(resp.read())
 
 
+def _openai_one(text, cfg, out):
+    r = subprocess.run([TTS, "-v", cfg["voice"], "-m", cfg["model"],
+                        "-s", str(cfg["speed"]), "-o", out],
+                       input=text, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"tts rc={r.returncode}: {r.stderr.strip()[:200]}")
+
+
+def synth_openai(text, cfg, out):
+    # OpenAI TTS caps each request at 4096 chars and the tts wrapper *truncates*
+    # past that — so chunk and concat (as deepgram/elevenlabs already do) or long
+    # turns get cut off mid-sentence. Speed is applied natively per chunk.
+    chunks = chunk_text(text, 3900)
+    if len(chunks) == 1:
+        _openai_one(chunks[0], cfg, out)
+        return
+    parts = []
+    for i, c in enumerate(chunks):
+        p = out.replace(".mp3", f".part{i}.mp3")
+        _openai_one(c, cfg, p)
+        parts.append(p)
+    concat_mp3s(parts, out)
+    for p in parts:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
 def synth(engine, cfg, text, out):
     """Render `text` to mp3 `out` via the chosen engine. Raises on failure."""
     if engine == "openai":
-        r = subprocess.run([TTS, "-v", cfg["voice"], "-m", cfg["model"],
-                            "-s", str(cfg["speed"]), "-o", out],
-                           input=text, capture_output=True, text=True)
-        if r.returncode != 0:
-            raise RuntimeError(f"tts rc={r.returncode}: {r.stderr.strip()[:200]}")
-        return  # OpenAI applies speed natively
+        synth_openai(text, cfg, out)
+        return  # OpenAI applies speed natively (per chunk)
     if engine == "deepgram":
         synth_deepgram(text, cfg["deepgram_voice"], out)
     elif engine == "elevenlabs":
