@@ -42,6 +42,8 @@ Scripts to create, configure, and verify the box itself: `provision-vps.sh` (Het
 
 This is personal tooling, published as reference rather than product. Paths assume my vault layout (`~/vault`), secrets load from `~/.env.sh`, and nothing here is packaged for installation. Read it for the patterns: audited mutation layers, provider abstractions, cron-friendly gather scripts that keep deterministic work out of the LLM's context window.
 
+System dependencies beyond Python: `curl` and `jq` (most scripts), and `ffmpeg` for the audio path — `tts.sh` and `read_aloud.py` chunk text past the providers' per-request limit and concat the resulting MP3s with ffmpeg, so long responses need it on the box. `vps/setup-vps.sh` installs all three; `vps/verify-vps.sh` checks for them.
+
 ## License
 
 MIT

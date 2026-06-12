@@ -67,7 +67,7 @@ fi
 # --- Key tools ---
 echo ""
 echo "--- Tools ---"
-for tool in git tmux python3 jq curl; do
+for tool in git tmux python3 jq curl ffmpeg; do
   printf "  %-35s " "$tool"
   if command -v "$tool" &>/dev/null; then
     echo "$PASS"
