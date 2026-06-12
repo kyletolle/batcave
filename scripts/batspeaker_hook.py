@@ -191,6 +191,13 @@ def sanitize(md):
     s = re.sub(r"^\s*\d+\.\s+", "", s, flags=re.M)            # numbered lists
     s = re.sub(r"^\s*[-*_]{3,}\s*$", "", s, flags=re.M)       # hr
     s = re.sub(r"[*_~]{1,3}", "", s)                          # emphasis marks
+    # TTS engines drop words around em dashes (ambiguous: long pause or skip?) —
+    # this is what swallowed "lever left" mid-request. Normalize prose dashes to
+    # commas: unambiguous pauses, the read-along note matches, and Kyle prefers
+    # commas anyway. Single hyphens (well-being) are left alone.
+    s = re.sub(r"\s*(?:—|--)\s*", ", ", s)                    # em dash -> comma
+    s = re.sub(r"\s*,(?:\s*,)+", ",", s)                      # collapse doubled commas
+    s = re.sub(r"\s+,", ",", s)                               # no space before comma
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
