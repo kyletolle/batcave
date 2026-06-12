@@ -519,16 +519,26 @@ def hook_entry():
         jlog("hook", status="skip", reason="no_transcript", transcript_path=tpath)
         return
     min_chars = cfg["min_chars"]
-    # The Stop hook can fire a beat before Claude Code flushes the final text
-    # block to the transcript, so poll for the conclusion instead of reading once.
-    spoken, attempts = "", 0
+    # The Stop hook can fire before the turn is fully on disk — either the final
+    # text block hasn't flushed, or (when a message is queued mid-turn) the hook
+    # fires while the turn is momentarily "ended on a tool call", before its
+    # closing prose exists. So poll until the latest turn clears min_chars AND
+    # ends on prose rather than a tool. Crucially, derive spoken and full from
+    # the SAME parse each iteration: reading them separately let a turn boundary
+    # slip between the two reads, so `full` could describe a newer/shorter turn
+    # than `spoken` (inverted) — that's what truncated the read-along note while
+    # the audio held different content.
+    spoken, full, attempts = "", "", 0
     try:
-        for attempts in range(1, 21):          # up to ~6s
-            spoken = sanitize(extract_spoken_turn(tpath))
-            if len(spoken.strip()) >= min_chars:
+        for attempts in range(1, 31):          # up to ~9s
+            turns = _turns_runs(tpath)
+            target = turns[-1] if turns else None
+            spoken = sanitize(_join_runs(_spoken_runs(target))) if target else ""
+            full = sanitize(_join_runs(target)) if target else ""
+            ends_on_prose = bool(target) and not target[-1][1]
+            if len(spoken.strip()) >= min_chars and ends_on_prose:
                 break
             time.sleep(0.3)
-        full = sanitize(extract_full_turn(tpath))
     except Exception:
         jlog("hook", status="error", stage="extract", tb=traceback.format_exc())
         return
