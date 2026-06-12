@@ -86,11 +86,37 @@ def is_real_user(entry):
     return False
 
 
-def extract_last_turn(transcript_path):
-    """The final run of assistant prose in the latest turn: text emitted after
-    the last tool call. Pre-tool narration ("let me check...") and text from
-    prior turns are dropped, so we speak only the conclusion the user reads."""
-    run = []
+# Short pre-tool prose runs (<= this many chars) are treated as "let me check..."
+# narration and dropped from the spoken side. Anything longer is real substance
+# and kept — a knowledge-gardener turn routinely writes the whole answer *before*
+# a closing Write/save-memory/todoist call, so dropping pre-tool prose wholesale
+# (the old behavior) silently swallowed the answer and spoke only the trailing scrap.
+NARRATION_MAX = 120
+
+
+def _turns_runs(transcript_path):
+    """Parse the transcript into turns. Returns a list of turns; each turn is a
+    list of [text, followed_by_tool] runs in order. A run is a maximal stretch of
+    assistant prose; followed_by_tool is True when a tool_use came immediately
+    after it within the same turn, False for the turn's trailing prose."""
+    turns = []
+    runs = []        # runs for the current (open) turn
+    buf = []         # text blocks for the current (open) run
+
+    def close_run(followed_by_tool):
+        text = "\n\n".join(t for t in buf if t.strip())
+        buf.clear()
+        if text.strip():
+            runs.append([text, followed_by_tool])
+        elif followed_by_tool and runs:
+            runs[-1][1] = True            # back-to-back tools: keep prior flag set
+
+    def end_turn():
+        close_run(False)
+        if runs:
+            turns.append([list(r) for r in runs])
+        runs.clear()
+
     with open(transcript_path) as f:
         for line in f:
             line = line.strip()
@@ -101,7 +127,7 @@ def extract_last_turn(transcript_path):
             except Exception:
                 continue
             if is_real_user(e):
-                run = []                      # new turn
+                end_turn()                    # new turn
             elif e.get("type") == "assistant":
                 content = e.get("message", {}).get("content")
                 if isinstance(content, list):
@@ -109,36 +135,42 @@ def extract_last_turn(transcript_path):
                         if not isinstance(b, dict):
                             continue
                         if b.get("type") == "text":
-                            run.append(b.get("text", ""))
+                            buf.append(b.get("text", ""))
                         elif b.get("type") == "tool_use":
-                            run = []          # drop narration before a tool call
-    return "\n\n".join(c for c in run if c.strip())
+                            close_run(True)
+    end_turn()
+    return turns
+
+
+def _join_runs(runs):
+    return "\n\n".join(t for t, _ in runs if t.strip())
+
+
+def _spoken_runs(runs):
+    """Smart trim: keep substantial runs and the turn's final prose; drop only
+    short narration runs that precede a tool call."""
+    out = []
+    for i, (text, followed_by_tool) in enumerate(runs):
+        is_last = i == len(runs) - 1
+        if (not followed_by_tool) or is_last or len(text.strip()) > NARRATION_MAX:
+            out.append((text, followed_by_tool))
+    return out
+
+
+def extract_spoken_turn(transcript_path):
+    """The latest turn's prose, smart-trimmed for the spoken side: real answers
+    are kept even when they precede a closing tool call; only short "let me
+    check..." narration before a tool is dropped."""
+    turns = _turns_runs(transcript_path)
+    return _join_runs(_spoken_runs(turns[-1])) if turns else ""
 
 
 def extract_full_turn(transcript_path):
-    """ALL assistant prose in the latest turn, including narration emitted
-    before tool calls — the full text Kyle would otherwise scroll on the laggy
-    Moshi terminal. Used for the written read-along note even when only the
-    conclusion (extract_last_turn) is spoken aloud."""
-    run = []
-    with open(transcript_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if is_real_user(e):
-                run = []                      # new turn
-            elif e.get("type") == "assistant":
-                content = e.get("message", {}).get("content")
-                if isinstance(content, list):
-                    for b in content:
-                        if isinstance(b, dict) and b.get("type") == "text":
-                            run.append(b.get("text", ""))  # keep pre-tool narration
-    return "\n\n".join(c for c in run if c.strip())
+    """ALL assistant prose in the latest turn, including pre-tool narration — the
+    full text Kyle would otherwise scroll on the laggy Moshi terminal. Used for
+    the written read-along note."""
+    turns = _turns_runs(transcript_path)
+    return _join_runs(turns[-1]) if turns else ""
 
 
 # ---------- markdown -> speech ----------
@@ -483,7 +515,7 @@ def hook_entry():
     spoken, attempts = "", 0
     try:
         for attempts in range(1, 21):          # up to ~6s
-            spoken = sanitize(extract_last_turn(tpath))
+            spoken = sanitize(extract_spoken_turn(tpath))
             if len(spoken.strip()) >= min_chars:
                 break
             time.sleep(0.3)
@@ -525,47 +557,33 @@ def hook_entry():
 # ---------- manual catch-up ("batspeaker last") ----------
 
 def find_active_transcript():
-    """Most-recently-modified transcript across all Claude projects = the live
-    session. Heuristic, but right in the common single-session case."""
+    """The live session's transcript. Newest-modified is the usual signal, but
+    Claude Code now appends metadata records (ai-title, mode, permission-mode,
+    attachment) to a transcript *before* the assistant replies, so the freshest
+    file can be all metadata with no prose yet — and concurrent sessions add more
+    churn. So: walk newest-first and return the first transcript whose latest turn
+    actually has readable assistant text; fall back to plain newest."""
     cands = glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl"))
-    return max(cands, key=os.path.getmtime) if cands else None
+    if not cands:
+        return None
+    cands.sort(key=os.path.getmtime, reverse=True)
+    for path in cands[:8]:
+        try:
+            if extract_full_turn(path).strip():
+                return path
+        except Exception:
+            continue
+    return cands[0]
 
 
 def last_n_turns_text(tpath, n, keep_narration=False):
     """Prose of each of the last n assistant turns, joined. With keep_narration
-    the full turn (incl. pre-tool narration) is kept; otherwise just the final
-    post-tool conclusion run."""
-    turns, run = [], []
-
-    def push():
-        joined = "\n\n".join(c for c in run if c.strip())
-        if joined.strip():
-            turns.append(joined)
-
-    with open(tpath) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except Exception:
-                continue
-            if is_real_user(e):
-                push()
-                run = []
-            elif e.get("type") == "assistant":
-                content = e.get("message", {}).get("content")
-                if isinstance(content, list):
-                    for b in content:
-                        if not isinstance(b, dict):
-                            continue
-                        if b.get("type") == "text":
-                            run.append(b.get("text", ""))
-                        elif b.get("type") == "tool_use" and not keep_narration:
-                            run = []
-    push()
-    return "\n\n".join(turns[-n:])
+    the full turn is kept; otherwise the spoken smart-trim (substance kept,
+    short pre-tool narration dropped)."""
+    turns = _turns_runs(tpath)
+    select = turns[-n:] if n else turns
+    parts = [_join_runs(t if keep_narration else _spoken_runs(t)) for t in select]
+    return "\n\n".join(p for p in parts if p.strip())
 
 
 def cmd_last(n):
