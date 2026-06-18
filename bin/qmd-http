@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# qmd-http — query the persistent QMD HTTP daemon (:8181) instead of spawning
+# a per-session stdio MCP child. One warm daemon serves every session: no
+# cold model load, no marketplace.json fragility, ~50-110 MB saved per session.
+#
+# Speaks MCP streamable-HTTP: initialize -> notifications/initialized ->
+# tools/call(query). Fresh handshake per invocation (sub-100ms; daemon stays warm).
+#
+# Usage:
+#   qmd-http "query text"                          # combined lex+vec (best recall)
+#   qmd-http "query text" --type lex               # single search type
+#   qmd-http "q" --type lex --type hyde            # repeatable
+#   qmd-http "q" --collection batcave --limit 10   # scope + count (--collection repeatable)
+#   qmd-http "q" --intent "disambiguation hint"
+#   qmd-http "q" --json                            # raw JSON-RPC result passthrough
+#
+# Notes:
+#   - vec/hyde queries: avoid hyphenated words ("self-care" parses as lex
+#     negation and errors). Rephrase without hyphens.
+#   - Read/query only. Embeds stay with the qmd-embed timer.
+#   - Falls back to BM25 CLI (qmd-query) if the daemon is unreachable after
+#     one systemctl start attempt.
+
+set -euo pipefail
+
+MCP_URL="${QMD_HTTP_URL:-http://localhost:8181/mcp}"
+CURL_OPTS=(-s --max-time 30 -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream')
+
+usage() {
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+query=""
+types=()
+collections=()
+limit=5
+intent=""
+json_out=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --type|-t)       types+=("$2"); shift 2 ;;
+        --collection|-c) collections+=("$2"); shift 2 ;;
+        --limit|-l)      limit="$2"; shift 2 ;;
+        --intent|-i)     intent="$2"; shift 2 ;;
+        --json|-j)       json_out=true; shift ;;
+        --help|-h)       usage ;;
+        *)
+            if [[ -z "$query" ]]; then query="$1"; else
+                echo "Unexpected argument: $1 (quote your query)" >&2; exit 1
+            fi
+            shift ;;
+    esac
+done
+
+[[ -z "$query" ]] && usage
+[[ ${#types[@]} -eq 0 ]] && types=(lex vec)
+
+for t in "${types[@]}"; do
+    case "$t" in lex|vec|hyde) ;; *) echo "Invalid --type: $t (lex|vec|hyde)" >&2; exit 1 ;; esac
+done
+
+# Strip a JSON-RPC response body that may arrive as SSE ("data: {...}" lines)
+# or plain JSON. The 2.1.0 daemon returns plain JSON today, but the Accept
+# header advertises text/event-stream, so parse defensively.
+extract_json() {
+    local body="$1"
+    if grep -q '^data:' <<<"$body"; then
+        grep '^data:' <<<"$body" | tail -1 | sed 's/^data: \{0,1\}//'
+    else
+        printf '%s' "$body"
+    fi
+}
+
+build_query_args() {
+    jq -n \
+        --arg q "$query" --arg intent "$intent" --argjson limit "$limit" \
+        --argjson types "$(printf '%s\n' "${types[@]}" | jq -R . | jq -s .)" \
+        --argjson colls "$( ((${#collections[@]})) && printf '%s\n' "${collections[@]}" | jq -R . | jq -s . || echo '[]')" \
+        '{searches: [$types[] | {type: ., query: $q}], limit: $limit, rerank: false}
+         + (if $intent != "" then {intent: $intent} else {} end)
+         + (if ($colls | length) > 0 then {collections: $colls} else {} end)'
+}
+
+mcp_init() {
+    # Echoes session id on success, fails otherwise.
+    local hdrs body
+    hdrs=$(mktemp)
+    trap 'rm -f "$hdrs"' RETURN
+    body=$(curl "${CURL_OPTS[@]}" -D "$hdrs" -X POST "$MCP_URL" -d '{
+        "jsonrpc":"2.0","id":1,"method":"initialize",
+        "params":{"protocolVersion":"2024-11-05","capabilities":{},
+                  "clientInfo":{"name":"qmd-http","version":"1.0"}}}') || return 1
+    grep -i '^mcp-session-id:' "$hdrs" | head -1 | tr -d '\r' | awk '{print $2}' | grep .
+}
+
+fallback_bm25() {
+    echo "[qmd-http] daemon unreachable at $MCP_URL — falling back to BM25 CLI (qmd-query, keyword-only)" >&2
+    exec qmd-query "$query" --limit "$limit"
+}
+
+sid=$(mcp_init) || {
+    systemctl --user start qmd-mcp.service 2>/dev/null || true
+    sleep 2
+    sid=$(mcp_init) || fallback_bm25
+}
+
+curl "${CURL_OPTS[@]}" -X POST "$MCP_URL" -H "mcp-session-id: $sid" \
+    -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null
+
+request=$(jq -n --argjson args "$(build_query_args)" \
+    '{jsonrpc:"2.0", id:2, method:"tools/call", params:{name:"query", arguments:$args}}')
+
+raw=$(curl "${CURL_OPTS[@]}" -X POST "$MCP_URL" -H "mcp-session-id: $sid" -d "$request")
+response=$(extract_json "$raw")
+
+if [[ $(jq -r 'has("error")' <<<"$response") == "true" ]]; then
+    echo "[qmd-http] daemon error: $(jq -r '.error.message' <<<"$response")" >&2
+    exit 1
+fi
+
+if $json_out; then
+    jq '.result' <<<"$response"
+else
+    text=$(jq -r '.result.content[0].text // empty' <<<"$response")
+    if [[ $(jq -r '.result.isError // false' <<<"$response") == "true" ]]; then
+        echo "[qmd-http] query error: $text" >&2
+        exit 1
+    fi
+    printf '%s\n' "$text"
+fi
