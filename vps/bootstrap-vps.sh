@@ -151,6 +151,7 @@ declare -A WRAPPERS=(
   [tts]="scripts/tts.sh"
   [read-aloud]="bin/read-aloud"
   [daily-read-aloud]="bin/daily-read-aloud"
+  [batspeaker]="bin/batspeaker"
   [ccusage-log]="vps/ccusage_daily_log.sh"
 )
 
@@ -313,11 +314,32 @@ AccuracySec=30s
 WantedBy=timers.target
 UNIT
 
+# Bat-Speaker live-listen server (auto-TTS playback page over Tailscale).
+# Canonical base unit. Any host-specific ExecStartPost/ExecStopPost hooks are
+# layered on by local provisioning after bootstrap, not committed here.
+cat > "$SYSTEMD_USER_DIR/batspeaker-serve.service" << 'UNIT'
+[Unit]
+Description=Bat-Speaker live listen server (auto-TTS playback page over Tailscale)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/kyle/.local/bin/batspeaker serve --host 127.0.0.1 --port 8765
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/home/kyle/vault
+Environment=HOME=/home/kyle
+Environment=PATH=/home/kyle/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+UNIT
+
 systemctl --user daemon-reload
 # Enable but don't start until migration/sync is complete
-systemctl --user enable qmd-mcp.service qmd-embed.timer 2>/dev/null || true
-echo "QMD systemd services created and enabled."
-echo "Start with: systemctl --user start qmd-mcp qmd-embed.timer"
+systemctl --user enable qmd-mcp.service qmd-embed.timer batspeaker-serve.service 2>/dev/null || true
+echo "QMD + batspeaker systemd services created and enabled."
+echo "Start with: systemctl --user start qmd-mcp qmd-embed.timer batspeaker-serve"
 echo ""
 
 # --- Step 8: (deprecated) moshi-notify user template ---
@@ -492,12 +514,14 @@ check "qmd-update wrapper" "test -L $WRAPPER_DIR/qmd-update"
 check "tts wrapper" "test -L $WRAPPER_DIR/tts"
 check "read-aloud wrapper" "test -L $WRAPPER_DIR/read-aloud"
 check "daily-read-aloud wrapper" "test -L $WRAPPER_DIR/daily-read-aloud"
+check "batspeaker wrapper" "test -L $WRAPPER_DIR/batspeaker"
 check "ccusage npm binary" "test -f \"\$(npm prefix -g)/bin/ccusage\""
 check "ccusage-log wrapper" "test -L $WRAPPER_DIR/ccusage-log"
 check "Commands symlink" "test -L $VAULT_DIR/.claude/commands"
 check "QMD reranker patched" "grep -q 'rerank: false' \"\$(find ~/.bun ~/.npm-global -path '*/qmd/dist/mcp/server.js' 2>/dev/null | head -1)\" 2>/dev/null"
 check "QMD MCP service" "test -f $HOME/.config/systemd/user/qmd-mcp.service"
 check "QMD embed timer" "test -f $HOME/.config/systemd/user/qmd-embed.timer"
+check "batspeaker-serve service" "test -f $HOME/.config/systemd/user/batspeaker-serve.service"
 check "ccusage cron job" "crontab -l 2>/dev/null | grep -q ccusage_daily_log"
 check "disk-watch cron job" "crontab -l 2>/dev/null | grep -q disk-watch"
 check "moshi-hook installed" "command -v moshi-hook"
