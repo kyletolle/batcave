@@ -1,191 +1,52 @@
 #!/usr/bin/env python3
-"""Bat-Speaker live listen server (Rung 2).
+"""Bat-Speaker v2 — transcript-driven web reader/listener.
 
-A small stdlib HTTP server that auto-plays new Bat-Speaker clips in a mobile
-browser over Tailscale — no Obsidian, no sync wait. Run on demand:
+A small stdlib HTTP server that renders Claude Code's own per-session transcripts
+as a tabbed, per-conversation reading surface, with on-demand and per-session
+auto TTS. Run on demand (or under systemd):
 
     batspeaker serve [--port 8765]
 
-Decoupled by design: this is a pure *reader* of the artifacts the Stop hook
-already produces (MP3s, the JSONL log, the Live note). It never writes them and
-makes zero changes to batspeaker_hook.py, so if it breaks, Rung 1 is untouched.
+v2 reverses v1's source of truth. v1 had the Stop hook write a single rolling
+markdown note that N racing background workers fought over (the lost-turns bug);
+this server reads the transcript JSONL files directly. No hook, no shared note,
+no race. Audio is generated lazily per turn — click "speak" on any turn, or flip
+a conversation into listen mode and new turns are voiced as they land.
 
-The hook's worker writes in order: MP3 -> Live-note entry -> JSONL worker/success
-record. We key off that success record (written last), so the MP3 and the note
-entry always exist by the time we emit an event. No race.
+Endpoints:
+    GET  /                       the page
+    GET  /sessions               JSON: list of conversations (tabs)
+    GET  /session?id=&n=         JSON: last n turns of one conversation
+    POST /tts   {session,turn}   synthesize one turn -> {url,duration}
+    GET  /audio/<id>.mp3         cached turn audio (HTTP Range for iOS)
+    GET  /events?session=        SSE: new turns for one conversation (+audio in listen mode)
+    GET  /config / POST /config  voice/engine/speed; per-session listen toggles
+    GET  /silence.mp3            silent prime that unlocks iOS autoplay
+    POST /restart                restart the systemd unit (pick up code edits)
 """
-import sys, os, re, json, time, socket, argparse, tempfile, subprocess
+import os, re, json, time, socket, argparse, tempfile, subprocess, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VAULT = os.environ.get("BATSPEAKER_VAULT") or os.path.expanduser("~/vault")
-MP3_DIR = os.path.join(VAULT, "3 Information", "Attachments", "batspeaker")
-NOTE = os.path.join(VAULT, "0 Inbox", "Bat-Speaker Live.md")
-LOG = os.path.expanduser("~/.local/state/batspeaker.jsonl")
-TOGGLE = os.path.expanduser("~/.batspeaker-on")   # presence = TTS generation on
-SERVICE = "batspeaker-serve"                        # systemd --user unit name
+import batspeaker_core as core
 
-MP3_RE = re.compile(r"^bruce-[0-9A-Za-z\-]+\.mp3$")   # filename whitelist
-HISTORY = 15                                          # clips shown in the list
+SERVICE = "batspeaker-serve"
+DEFAULT_N = 12                       # turns rendered per conversation
+LISTEN_FILE = os.path.join(core.HOME, ".cache", "batspeaker", "listen.json")
 
-# Config is shared with the Stop hook (it reads this file fresh each turn via
-# load_config()), so a change made from the page is picked up on the NEXT turn.
-CONFIG = os.path.expanduser("~/.config/batspeaker/config.json")
-# Mirror the hook's defaults for the keys the panel surfaces, so the UI shows
-# real current values even when config.json doesn't set them yet.
-CFG_DEFAULTS = {
-    "engine": "openai", "voice": "ash", "model": "tts-1-hd",
-    "deepgram_voice": "orpheus",
-    "elevenlabs_voice": "nPczCjzI2devNBz1zQrb",
-    "elevenlabs_model": "eleven_multilingual_v2",
-    "speed": "1.0",
-    "notify": True, "append_when_off": True, "keep": 15, "min_chars": 12,
-}
+# Voice settings are the only editable config keys; everything else in
+# config.json (if present) is left untouched.
 EDITABLE = {"engine", "voice", "model", "deepgram_voice",
-            "elevenlabs_voice", "elevenlabs_model", "speed",
-            "notify", "append_when_off", "keep", "min_chars"}
-BOOL_KEYS = {"notify", "append_when_off"}
-INT_KEYS = {"keep": (1, 100), "min_chars": (0, 10000)}   # key -> (lo, hi) clamp
+            "elevenlabs_voice", "elevenlabs_model", "speed"}
 ENGINES = {"openai", "deepgram", "elevenlabs"}
+OPENAI_VOICES = ["alloy", "ash", "coral", "echo", "fable",
+                 "nova", "onyx", "sage", "shimmer"]
+
+ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-# ---------- artifact readers ----------
-
-def iter_success_records():
-    """Yield every worker/success record in the JSONL log, in order."""
-    if not os.path.exists(LOG):
-        return
-    with open(LOG) as f:
-        for line in f:
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if (r.get("event") == "worker" and r.get("status") == "success"
-                    and (r.get("mp3") or r.get("id"))):
-                yield r
-
-
-def record_id(r):
-    """Stable id for a clip record. Newer records carry an explicit `id`;
-    legacy audio records are identified by their MP3 filename stem."""
-    rid = r.get("id")
-    if rid:
-        return rid
-    mp3 = r.get("mp3")
-    return mp3[:-4] if mp3 else None
-
-
-def spoken_text(mp3):
-    """Full spoken text for a clip (paragraphs preserved as \\n\\n), read from
-    the Live note's blockquote. Best-effort: '' if the entry isn't found."""
-    try:
-        with open(NOTE) as f:
-            content = f.read()
-    except Exception:
-        return ""
-    marker = f"![[batspeaker/{mp3}]]"
-    idx = content.find(marker)
-    if idx == -1:
-        return ""
-    after = content[idx + len(marker):]
-    paras, cur = [], []
-    for ln in after.splitlines():
-        s = ln.strip()
-        if s.startswith(">"):
-            body = s.lstrip(">").strip()
-            if body:
-                cur.append(body)
-            elif cur:                      # blank quote line -> paragraph break
-                paras.append(" ".join(cur)); cur = []
-        elif cur or paras:
-            break                          # blockquote ended
-        # leading blank lines before the quote starts are skipped
-    if cur:
-        paras.append(" ".join(cur))
-    return "\n\n".join(paras)
-
-
-def clip_payload(rec):
-    mp3 = rec.get("mp3")
-    # Newer records log the read-along text directly (works for text-only
-    # entries and survives note pruning); fall back to the note for legacy ones.
-    text = rec.get("text")
-    if text is None:
-        text = spoken_text(mp3) if mp3 else ""
-    one = " ".join(text.split())
-    caption = (one[:160].rstrip() + "…") if len(one) > 160 else one
-    return {
-        "id": record_id(rec),
-        "mp3": mp3,
-        "url": f"/clips/{mp3}" if mp3 else None,   # text-only clips have no player
-        "duration": rec.get("duration"),
-        "ts": rec.get("ts"),
-        "caption": caption,   # short label for the history list
-        "text": text,         # full read-along text
-    }
-
-
-def recent_clips(n=HISTORY):
-    recs = list(iter_success_records())
-    return [clip_payload(r) for r in reversed(recs[-n:])]   # newest first
-
-
-# ---------- config (shared with the Stop hook) ----------
-
-def as_bool(v):
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return bool(v)
-    if isinstance(v, str):
-        return v.strip().lower() in ("1", "true", "on", "yes")
-    return bool(v)
-
-
-def tts_enabled():
-    """TTS generation is gated by the presence of the ~/.batspeaker-on file —
-    the same toggle the `batspeaker on|off` CLI flips and the hook reads."""
-    return os.path.exists(TOGGLE)
-
-
-def set_tts(on):
-    """Create/remove the toggle file. The hook reads it fresh each turn, so the
-    change takes effect on the next turn Bruce speaks — no restart needed."""
-    if on:
-        open(TOGGLE, "a").close()
-    else:
-        try:
-            os.remove(TOGGLE)
-        except FileNotFoundError:
-            pass
-    return tts_enabled()
-
-
-def restart_service():
-    """Bounce the systemd --user unit so a fresh process picks up code changes.
-    Detached + delayed so this request's response flushes before we're killed;
-    systemd brings the new process up and the page's SSE auto-reconnects."""
-    subprocess.Popen(
-        ["sh", "-c", f"sleep 1; systemctl --user restart {SERVICE}"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True)
-
-
-def effective_cfg():
-    """CFG_DEFAULTS overlaid with whatever's in the config file."""
-    cfg = dict(CFG_DEFAULTS)
-    try:
-        with open(CONFIG) as f:
-            cfg.update(json.load(f))
-    except Exception:
-        pass
-    return cfg
-
+# ---------- config ----------
 
 def update_cfg(updates):
-    """Merge validated, editable-only keys into the config file. Returns the
-    cleaned subset that was applied. Never touches non-editable keys (keep,
-    notify, title, etc.) the hook also stores there."""
     clean = {}
     for k, v in (updates or {}).items():
         if k not in EDITABLE:
@@ -194,27 +55,82 @@ def update_cfg(updates):
             continue
         if k == "speed":
             v = str(v)
-        elif k in BOOL_KEYS:
-            v = as_bool(v)
-        elif k in INT_KEYS:
-            try:
-                v = int(v)
-            except (ValueError, TypeError):
-                continue
-            lo, hi = INT_KEYS[k]
-            v = max(lo, min(hi, v))
         clean[k] = v
     cfg = {}
     try:
-        with open(CONFIG) as f:
+        with open(core.CONFIG) as f:
             cfg = json.load(f)
     except Exception:
         cfg = {}
     cfg.update(clean)
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    with open(CONFIG, "w") as f:
+    os.makedirs(os.path.dirname(core.CONFIG), exist_ok=True)
+    with open(core.CONFIG, "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
     return clean
+
+
+# ---------- per-session listen mode ----------
+
+_listen_lock = threading.Lock()
+_listen = set()
+
+
+def _load_listen():
+    global _listen
+    try:
+        with open(LISTEN_FILE) as f:
+            _listen = set(json.load(f))
+    except Exception:
+        _listen = set()
+
+
+def _save_listen():
+    try:
+        os.makedirs(os.path.dirname(LISTEN_FILE), exist_ok=True)
+        with open(LISTEN_FILE, "w") as f:
+            json.dump(sorted(_listen), f)
+    except Exception:
+        pass
+
+
+def is_listening(session_id):
+    with _listen_lock:
+        return session_id in _listen
+
+
+def set_listening(session_id, on):
+    with _listen_lock:
+        if on:
+            _listen.add(session_id)
+        else:
+            _listen.discard(session_id)
+        _save_listen()
+        return session_id in _listen
+
+
+# ---------- payload builders ----------
+
+def turn_payload(turn, with_html=True):
+    audio = core.audio_path_for(turn["id"])
+    has_audio = os.path.exists(audio) and os.path.getsize(audio) > 0
+    p = {
+        "id": turn["id"],
+        "ts": turn.get("ts"),
+        "user": core.caption(turn.get("user", ""), 200),
+        "has_audio": has_audio,
+        "audio_url": f"/audio/{turn['id']}.mp3" if has_audio else None,
+    }
+    if with_html:
+        p["html"] = core.md_to_html(core.turn_full_md(turn))
+    return p
+
+
+def session_turns(session_id, n=DEFAULT_N):
+    path = core.session_path(session_id)
+    if not path:
+        return None
+    turns = core.parse_turns(path)
+    return [turn_payload(t) for t in turns[-n:]]
 
 
 # ---------- silent priming clip (iOS autoplay unlock) ----------
@@ -223,9 +139,6 @@ _SILENCE = None
 
 
 def get_silence():
-    """A short, *valid* silent MP3 used to unlock the <audio> element inside the
-    Start-tap gesture. iOS only honours a later programmatic play() if a real
-    play() succeeded during a user gesture — an empty data-URI doesn't count."""
     global _SILENCE
     if _SILENCE is not None:
         return _SILENCE
@@ -243,378 +156,323 @@ def get_silence():
     return _SILENCE
 
 
+def restart_service():
+    subprocess.Popen(
+        ["bash", "-lc", f"sleep 1; systemctl --user restart {SERVICE}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def tailnet_ip():
+    try:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                             text=True, timeout=5).stdout.strip().splitlines()
+        return out[0] if out else None
+    except Exception:
+        return None
+
+
 # ---------- HTML page ----------
 
-PAGE = """<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Bat-Speaker</title>
 <style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; font: 16px/1.5 -apple-system, system-ui, sans-serif;
-    background: #0d0f12; color: #e7e9ee;
-    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
-  }
-  header { padding: 20px 0 12px; }
-  h1 { font-size: 1.25rem; margin: 0; letter-spacing: .02em; }
-  .sub { color: #8b93a3; font-size: .85rem; margin-top: 2px; }
-  button.cta {
-    display: block; width: 100%; padding: 18px; margin: 16px 0;
-    font-size: 1.1rem; font-weight: 600; color: #0d0f12; background: #f5b945;
-    border: 0; border-radius: 14px; cursor: pointer;
-  }
-  button.cta:active { transform: scale(.99); }
-  .status { display: flex; align-items: center; gap: 8px; color: #8b93a3;
-    font-size: .85rem; margin: 4px 0 12px; }
-  /* config panel */
-  #cfgBar { margin-bottom: 16px; }
-  button.ghost { width: 100%; text-align: left; background: #15191f;
-    color: #cfd4dd; border: 1px solid #232a33; border-radius: 12px;
-    padding: 12px 14px; font-size: .9rem; cursor: pointer; }
-  button.ghost #cfgSummary { color: #f5b945; }
-  #cfgPanel { background: #15191f; border: 1px solid #232a33; border-top: 0;
-    border-radius: 0 0 12px 12px; margin-top: -8px; padding: 14px;
-    display: flex; flex-direction: column; gap: 12px; }
-  /* ID+class beats the #cfgPanel ID selector above, so .hidden can win */
-  #cfgPanel.hidden { display: none; }
-  #cfgToggle .chev { display: inline-block; transition: transform .15s ease;
-    color: #8b93a3; margin-right: 4px; }
-  #cfgToggle.open .chev { transform: rotate(90deg); }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  button.chip { flex: 1; min-width: 88px; padding: 10px; border-radius: 10px;
-    border: 1px solid #2a323d; background: #1b212a; color: #cfd4dd;
-    font-size: .9rem; cursor: pointer; }
-  button.chip.active { background: #f5b945; color: #0d0f12; border-color: #f5b945;
-    font-weight: 600; }
-  .lbl { display: flex; justify-content: space-between; align-items: center;
-    color: #8b93a3; font-size: .85rem; gap: 12px; }
-  .lbl select { background: #1b212a; color: #e7e9ee; border: 1px solid #2a323d;
-    border-radius: 8px; padding: 8px 10px; font-size: .9rem; min-width: 130px; }
-  .note { color: #6b7280; font-size: .78rem; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: #555; flex: none; }
-  .dot.live { background: #46d27e; box-shadow: 0 0 8px #46d27e; }
-  .dot.playing { background: #f5b945; box-shadow: 0 0 8px #f5b945; }
-  #now { background: #15191f; border: 1px solid #232a33; border-radius: 14px;
-    padding: 14px; margin-bottom: 18px; }
-  /* Player stays pinned to the top of the viewport while you scroll the
-     read-along text, so it never leaves the screen and gets auto-paused. */
-  #nowHead { position: sticky; top: 0; z-index: 2; background: #15191f;
-    padding-bottom: 6px; }
-  #now .meta { font-size: .8rem; color: #8b93a3; margin-bottom: 6px; }
-  #nowText { white-space: pre-wrap; color: #cfd4dd; margin-top: 12px;
-    font-size: .98rem; line-height: 1.55; }
-  audio { width: 100%; margin-top: 10px; }
-  h2 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
-    color: #6b7280; margin: 18px 0 8px; }
-  .clip { padding: 12px 0; border-top: 1px solid #1c222a; }
-  .clip .meta { font-size: .78rem; color: #7c8493; margin-bottom: 4px; }
-  .clip .ctext { white-space: pre-wrap; color: #b8bdc8; font-size: .95rem;
-    line-height: 1.55; margin-top: 8px; }
-  /* big TTS generation switch (the ~/.batspeaker-on toggle) */
-  #ttsToggle { display: flex; align-items: center; justify-content: space-between;
-    width: 100%; padding: 14px 16px; margin-bottom: 12px; cursor: pointer;
-    border-radius: 12px; border: 1px solid #232a33; background: #15191f;
-    color: #cfd4dd; font-size: .95rem; font-weight: 600; }
-  #ttsToggle .pill { font-size: .8rem; font-weight: 700; padding: 4px 12px;
-    border-radius: 999px; background: #2a323d; color: #8b93a3; letter-spacing: .04em; }
-  #ttsToggle.on { border-color: #46d27e; }
-  #ttsToggle.on .pill { background: #46d27e; color: #07130c; }
-  .toggle { min-width: 64px; padding: 7px 12px; border-radius: 8px;
-    border: 1px solid #2a323d; background: #1b212a; color: #8b93a3;
-    font-size: .85rem; font-weight: 600; cursor: pointer; }
-  .toggle.on { background: #46d27e; color: #07130c; border-color: #46d27e; }
-  .lbl input[type=number] { background: #1b212a; color: #e7e9ee;
-    border: 1px solid #2a323d; border-radius: 8px; padding: 8px 10px;
-    font-size: .9rem; width: 90px; }
-  #restartBtn { margin-top: 4px; }
-  .hr { height: 1px; background: #232a33; margin: 4px 0; }
-  .hidden { display: none; }
+  :root { --bg:#0f1115; --panel:#171a21; --panel2:#1f232c; --fg:#e7e9ee;
+          --mut:#8b93a3; --acc:#f2b53b; --acc2:#3b82f6; --line:#272c36; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; }
+  body { background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,
+         BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; flex-direction:column; }
+  header { display:flex; align-items:center; gap:.5rem; padding:.55rem .7rem;
+           background:var(--panel); border-bottom:1px solid var(--line);
+           padding-top:max(.55rem, env(safe-area-inset-top)); }
+  header .title { font-weight:700; color:var(--acc); letter-spacing:.2px; }
+  header .sp { flex:1; }
+  button { font:inherit; color:var(--fg); background:var(--panel2);
+           border:1px solid var(--line); border-radius:.5rem; padding:.35rem .6rem;
+           cursor:pointer; }
+  button:active { transform:translateY(1px); }
+  .icon { padding:.35rem .5rem; }
+  #tabs { display:flex; gap:.4rem; overflow-x:auto; padding:.5rem .6rem;
+          background:var(--panel); border-bottom:1px solid var(--line);
+          scrollbar-width:none; }
+  #tabs::-webkit-scrollbar { display:none; }
+  .tab { flex:0 0 auto; max-width:62vw; padding:.4rem .6rem; border-radius:.6rem;
+         background:var(--panel2); border:1px solid var(--line); color:var(--fg);
+         white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:.9rem; }
+  .tab.active { border-color:var(--acc); color:var(--acc); }
+  .tab .cnt { color:var(--mut); font-size:.78rem; margin-left:.35rem; }
+  .tab .ear { margin-left:.3rem; }
+  #thread { flex:1; overflow-y:auto; padding:.7rem .7rem 4rem;
+            -webkit-overflow-scrolling:touch; }
+  .turn { background:var(--panel); border:1px solid var(--line);
+          border-radius:.7rem; padding:.7rem .8rem; margin:0 auto .8rem; max-width:760px; }
+  .turn .q { color:var(--mut); font-size:.86rem; border-left:2px solid var(--line);
+             padding-left:.55rem; margin-bottom:.55rem; white-space:pre-wrap; }
+  .turn .body p:first-child { margin-top:0; }
+  .turn .body p:last-child { margin-bottom:0; }
+  .turn .body pre { background:#0b0d11; border:1px solid var(--line);
+                    border-radius:.4rem; padding:.6rem; overflow-x:auto; font-size:.85rem; }
+  .turn .body code { background:#0b0d11; padding:.05rem .3rem; border-radius:.3rem; font-size:.9em; }
+  .turn .body blockquote { color:var(--mut); border-left:3px solid var(--line);
+                           margin:.5rem 0; padding-left:.7rem; }
+  .turn .body h1,.turn .body h2,.turn .body h3 { font-size:1.05rem; margin:.7rem 0 .35rem; }
+  .row { display:flex; align-items:center; gap:.6rem; margin-top:.6rem; }
+  .row audio { flex:1; height:34px; }
+  .speak { font-size:.85rem; }
+  .speak.busy { opacity:.5; }
+  .sub { color:var(--mut); font-size:.78rem; }
+  #bar { position:sticky; bottom:0; display:flex; align-items:center; gap:.6rem;
+         padding:.55rem .7rem; padding-bottom:max(.55rem, env(safe-area-inset-bottom));
+         background:var(--panel); border-top:1px solid var(--line); }
+  #bar .grow { flex:1; }
+  .switch { display:inline-flex; align-items:center; gap:.4rem; font-size:.86rem; }
+  .switch input { width:38px; height:22px; }
+  #panel { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none;
+           align-items:flex-end; z-index:20; }
+  #panel.open { display:flex; }
+  #panel .card { background:var(--panel); width:100%; max-width:760px; margin:0 auto;
+                 border-radius:.8rem .8rem 0 0; padding:1rem; border:1px solid var(--line); }
+  #panel label { display:block; margin:.6rem 0 .2rem; color:var(--mut); font-size:.85rem; }
+  #panel select, #panel input[type=number] { width:100%; padding:.45rem; background:var(--panel2);
+       color:var(--fg); border:1px solid var(--line); border-radius:.45rem; }
+  .empty { color:var(--mut); text-align:center; margin-top:3rem; }
+  .toast { position:fixed; left:50%; bottom:5rem; transform:translateX(-50%);
+           background:#2a2f3a; border:1px solid var(--line); padding:.5rem .8rem;
+           border-radius:.5rem; opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
 </style>
 </head>
 <body>
 <header>
-  <h1>🔊 Bat-Speaker</h1>
-  <div class="sub">Live listen — new clips auto-play as Bruce finishes a turn.</div>
+  <span class="title">🔊 Bat-Speaker</span>
+  <span class="sub" id="now"></span>
+  <span class="sp"></span>
+  <button class="icon" id="startBtn" title="Unlock audio">▶︎ Listen</button>
+  <button class="icon" id="gearBtn" title="Settings">⚙</button>
+  <button class="icon" id="reloadBtn" title="Refresh tabs">↻</button>
 </header>
-
-<button id="start" class="cta">▶ Start Listening</button>
-
-<div class="status"><span class="dot" id="dot"></span><span id="statusText">Tap to begin</span></div>
-
-<button id="ttsToggle" title="Toggle whether Bruce's turns are spoken aloud">
-  <span>🎙️ TTS generation</span><span class="pill" id="ttsState">…</span>
-</button>
-
-<div id="cfgBar">
-  <button id="cfgToggle" class="ghost"><span class="chev">▸</span>⚙ Settings — <span id="cfgSummary">…</span></button>
-  <div id="cfgPanel" class="hidden">
-    <div class="row" id="engineRow"></div>
-    <label class="lbl">Voice <select id="voiceSel"></select></label>
-    <label class="lbl">Generation speed <select id="speedSel">
-      <option value="0.75">0.75×</option>
-      <option value="1.0">1.0×</option>
-      <option value="1.25">1.25×</option>
-      <option value="1.5">1.5×</option>
-      <option value="2.0">2.0×</option>
-    </select></label>
-    <div class="hr"></div>
-    <div class="lbl">Moshi push notifications <button id="notifyBtn" class="toggle"></button></div>
-    <div class="lbl">Append text when TTS off <button id="appendBtn" class="toggle"></button></div>
-    <label class="lbl">Clips kept <input id="keepInp" type="number" min="1" max="100"></label>
-    <label class="lbl">Min characters <input id="minInp" type="number" min="0" max="10000"></label>
-    <div class="hr"></div>
-    <button id="restartBtn" class="ghost">↻ Restart server (after code changes)</button>
-    <div id="cfgNote" class="note">Settings apply to the next turn Bruce speaks — no restart needed.</div>
-  </div>
+<div id="tabs"></div>
+<div id="thread"><div class="empty">Pick a conversation above.</div></div>
+<div id="bar">
+  <label class="switch"><input type="checkbox" id="listenToggle">
+    <span>Auto-speak this conversation</span></label>
+  <span class="grow"></span>
+  <span class="sub" id="liveDot">●</span>
 </div>
 
-<div id="now" class="hidden">
-  <div id="nowHead">
-    <div class="meta" id="nowMeta"></div>
-    <audio id="player" controls playsinline preload="auto"></audio>
-    <button id="newClip" class="cta hidden">▶ Play new clip</button>
+<div id="panel"><div class="card">
+  <strong>Voice settings</strong>
+  <label>Engine</label>
+  <select id="cfgEngine">
+    <option value="openai">OpenAI</option>
+    <option value="deepgram">Deepgram</option>
+    <option value="elevenlabs">ElevenLabs</option>
+  </select>
+  <label>OpenAI voice</label>
+  <select id="cfgVoice"></select>
+  <label>Speed</label>
+  <input type="number" id="cfgSpeed" min="0.5" max="3" step="0.05">
+  <div class="row" style="margin-top:1rem;">
+    <button id="cfgSave">Save</button>
+    <span class="grow"></span>
+    <button id="cfgRestart">Restart server</button>
+    <button id="panelClose">Close</button>
   </div>
-  <div id="nowText"></div>
-</div>
+  <p class="sub">Voice changes apply to the next turn you synthesize.</p>
+</div></div>
 
-<h2>Recent</h2>
-<div id="history"></div>
+<div class="toast" id="toast"></div>
 
 <script>
-const player = document.getElementById('player');
-const startBtn = document.getElementById('start');
-const newClipBtn = document.getElementById('newClip');
-const dot = document.getElementById('dot');
-const statusText = document.getElementById('statusText');
-const nowBox = document.getElementById('now');
-const nowMeta = document.getElementById('nowMeta');
-const nowText = document.getElementById('nowText');
-const historyEl = document.getElementById('history');
+const $ = s => document.querySelector(s);
+let sessions = [], active = null, es = null;
+let audioUnlocked = false, queue = [], playing = false;
+const seen = new Set();
+const unlockEl = new Audio();
 
-let queue = [];
-let playing = false;
-let started = false;
-let pending = null;
-let currentNow = null;          // clip in the Now Playing box (not yet in the feed)
-let currentHistory = [];
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.classList.add("show");
+  clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove("show"),1800); }
 
-function fmtDur(d) { return d ? d + 's' : ''; }
-function fmtTs(ts) { if (!ts) return ''; const t = (ts.split('T')[1] || ts); return t.slice(0, 5); }
-function setStatus(cls, txt) { dot.className = 'dot ' + cls; statusText.textContent = txt; }
+function fmtTime(ts){ if(!ts) return ""; const d=new Date(ts);
+  return isNaN(d)?"":d.toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}); }
 
-// Each clip renders as its own inline <audio controls> plus the FULL spoken
-// text for read-along. Manual taps are user gestures, so the inline players
-// never hit autoplay blocks.
-function renderHistory(clips) {
-  historyEl.innerHTML = '';
-  for (const c of clips) {
-    const div = document.createElement('div');
-    div.className = 'clip';
-    const metaDiv = document.createElement('div');
-    metaDiv.className = 'meta';
-    // text-only clips (toggle off) have no audio — label them, skip the player.
-    const tag = c.url ? [] : ['📄 text'];
-    metaDiv.textContent = [fmtTs(c.ts), fmtDur(c.duration), ...tag].filter(Boolean).join(' · ');
-    div.appendChild(metaDiv);
-    if (c.url) {
-      const a = document.createElement('audio');
-      a.controls = true; a.preload = 'none'; a.src = c.url;
-      a.setAttribute('playsinline', '');
-      div.appendChild(a);
-    }
-    const txt = document.createElement('div');
-    txt.className = 'ctext';
-    txt.textContent = c.text || c.caption || '';
-    div.appendChild(txt);
-    historyEl.appendChild(div);
-  }
+async function loadSessions(){
+  const r = await fetch("/sessions"); sessions = await r.json();
+  renderTabs();
+  if(!active && sessions.length){ selectSession(sessions[0].id); }
 }
 
-function playNext() {
-  if (!queue.length) { playing = false; setStatus('live', 'Listening — waiting for the next turn'); return; }
-  playing = true;
-  const c = queue.shift();
-  // Demote the previous live clip into the feed so it isn't shown twice.
-  if (currentNow) {
-    currentHistory = [currentNow, ...currentHistory];
-    renderHistory(currentHistory.slice(0, 30));
-  }
-  currentNow = c;
-  nowBox.classList.remove('hidden');
-  nowMeta.textContent = [fmtTs(c.ts), fmtDur(c.duration)].filter(Boolean).join(' · ');
-  nowText.textContent = c.text || c.caption || '';
-  window.scrollTo(0, 0);
-  newClipBtn.classList.add('hidden');
-  player.src = c.url;
-  setStatus('playing', 'Playing' + (queue.length ? ' (' + queue.length + ' queued)' : ''));
-  player.play().catch(() => {
-    // iOS still blocked it — surface a one-tap fallback (a real gesture).
-    playing = false;
-    pending = c;
-    newClipBtn.classList.remove('hidden');
-    setStatus('live', 'New clip ready — tap ▶');
+function renderTabs(){
+  const el = $("#tabs"); el.innerHTML = "";
+  sessions.forEach(s => {
+    const b = document.createElement("button");
+    b.className = "tab" + (s.id===active ? " active":"");
+    b.innerHTML = `<span>${escapeHtml(s.title)}</span><span class="cnt">${s.turns}</span>` +
+                  (s.listening ? `<span class="ear">🎧</span>`:"");
+    b.onclick = () => selectSession(s.id);
+    el.appendChild(b);
   });
 }
-player.addEventListener('ended', playNext);
 
-newClipBtn.addEventListener('click', () => {
-  newClipBtn.classList.add('hidden');
-  if (pending) { queue.unshift(pending); pending = null; }
-  if (!playing) playNext();
-});
-
-function enqueue(clip) {
-  // text-only clips (toggle off): nothing to play — prepend to the live feed.
-  if (!clip.url) {
-    currentHistory = [clip, ...currentHistory];
-    renderHistory(currentHistory.slice(0, 30));
-    if (!playing) setStatus('live', 'New text — read below');
-    return;
-  }
-  queue.push(clip);
-  if (!playing) playNext();
+async function selectSession(id){
+  active = id;
+  const s = sessions.find(x=>x.id===id);
+  $("#now").textContent = s ? (s.cwd ? s.cwd.split("/").pop() : "") : "";
+  $("#listenToggle").checked = !!(s && s.listening);
+  renderTabs();
+  seen.clear();
+  const thread = $("#thread"); thread.innerHTML = `<div class="empty">Loading…</div>`;
+  const r = await fetch(`/session?id=${id}&n=20`);
+  if(!r.ok){ thread.innerHTML = `<div class="empty">Couldn't load.</div>`; return; }
+  const turns = await r.json();
+  thread.innerHTML = "";
+  if(!turns.length){ thread.innerHTML = `<div class="empty">No turns yet.</div>`; }
+  turns.forEach(t => { seen.add(t.id); thread.appendChild(renderTurn(t)); });
+  thread.scrollTop = thread.scrollHeight;
+  openStream(id);
 }
 
-function connect() {
-  const es = new EventSource('/events');
-  es.onopen = () => { if (!playing && !queue.length) setStatus('live', 'Listening — waiting for the next turn'); };
-  es.onmessage = (e) => { try { enqueue(JSON.parse(e.data)); } catch (_) {} };
-  es.onerror = () => { setStatus('', 'Reconnecting…'); };  // EventSource auto-retries
+function renderTurn(t){
+  const card = document.createElement("div");
+  card.className = "turn"; card.dataset.id = t.id;
+  card.innerHTML =
+    (t.user ? `<div class="q">${escapeHtml(t.user)}</div>`:"") +
+    `<div class="body">${t.html||""}</div>` +
+    `<div class="row">
+       <button class="speak">🔊 Speak</button>
+       <span class="sub">${fmtTime(t.ts)}</span>
+       <span class="grow"></span>
+     </div>`;
+  const row = card.querySelector(".row");
+  const speak = card.querySelector(".speak");
+  speak.onclick = () => requestTTS(t.id, card, speak);
+  if(t.audio_url){ attachAudio(card, t.audio_url); }
+  return card;
 }
 
-startBtn.addEventListener('click', () => {
-  if (started) return;
-  started = true;
-  // Unlock autoplay: play a real (silent) clip inside the user gesture.
-  player.src = '/silence.mp3';
-  player.play().catch(() => {});
-  startBtn.classList.add('hidden');
-  setStatus('live', 'Listening — waiting for the next turn');
-  connect();
-});
-
-// ---- in-page config (presets = which engine; each remembers its own voice) ----
-const cfgToggle = document.getElementById('cfgToggle');
-const cfgPanel = document.getElementById('cfgPanel');
-const cfgSummary = document.getElementById('cfgSummary');
-const cfgNote = document.getElementById('cfgNote');
-const engineRow = document.getElementById('engineRow');
-const voiceSel = document.getElementById('voiceSel');
-const speedSel = document.getElementById('speedSel');
-const ttsToggle = document.getElementById('ttsToggle');
-const ttsState = document.getElementById('ttsState');
-const notifyBtn = document.getElementById('notifyBtn');
-const appendBtn = document.getElementById('appendBtn');
-const keepInp = document.getElementById('keepInp');
-const minInp = document.getElementById('minInp');
-const restartBtn = document.getElementById('restartBtn');
-
-function setToggleBtn(btn, on) {
-  btn.textContent = on ? 'On' : 'Off';
-  btn.classList.toggle('on', !!on);
+function attachAudio(card, url){
+  if(card.querySelector("audio")) return;
+  const a = document.createElement("audio");
+  a.controls = true; a.preload = "none"; a.src = url;
+  card.querySelector(".row").insertBefore(a, card.querySelector(".grow"));
+  const sp = card.querySelector(".speak"); if(sp) sp.style.display="none";
+  return a;
 }
 
-const ENGINE_LABEL = { openai: 'OpenAI', deepgram: 'Deepgram', elevenlabs: 'ElevenLabs' };
-// For each engine: which config key holds its voice, and the [label, value] list.
-const VOICES = {
-  openai: { key: 'voice', opts: [['alloy','alloy'],['ash','ash'],['coral','coral'],['echo','echo'],['fable','fable'],['nova','nova'],['onyx','onyx'],['sage','sage'],['shimmer','shimmer']] },
-  deepgram: { key: 'deepgram_voice', opts: [['orpheus','orpheus'],['asteria','asteria'],['luna','luna'],['stella','stella'],['athena','athena'],['hera','hera'],['orion','orion'],['arcas','arcas'],['perseus','perseus'],['angus','angus'],['helios','helios'],['zeus','zeus']] },
-  elevenlabs: { key: 'elevenlabs_voice', opts: [['Brian','nPczCjzI2devNBz1zQrb']] }
-};
-let cfg = {};
-
-function voiceLabel(engine, val) {
-  const spec = VOICES[engine]; if (!spec) return val;
-  const m = spec.opts.find(o => o[1] === val); return m ? m[0] : val;
+async function requestTTS(turnId, card, btn){
+  if(!active) return;
+  btn.classList.add("busy"); btn.textContent = "… synthesizing";
+  try{
+    const r = await fetch("/tts", {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({session:active, turn:turnId})});
+    const d = await r.json();
+    if(d.url){ const a = attachAudio(card, d.url); if(audioUnlocked && a){ a.play().catch(()=>{}); } }
+    else { toast(d.error||"TTS failed"); btn.classList.remove("busy"); btn.textContent="🔊 Speak"; }
+  }catch(e){ toast("TTS failed"); btn.classList.remove("busy"); btn.textContent="🔊 Speak"; }
 }
 
-function renderCfg() {
-  const engine = VOICES[cfg.engine] ? cfg.engine : 'openai';
-  engineRow.innerHTML = '';
-  for (const e of ['openai', 'deepgram', 'elevenlabs']) {
-    const b = document.createElement('button');
-    b.className = 'chip' + (engine === e ? ' active' : '');
-    b.textContent = ENGINE_LABEL[e];
-    b.onclick = () => postCfg({ engine: e });
-    engineRow.appendChild(b);
-  }
-  const spec = VOICES[engine];
-  voiceSel.innerHTML = '';
-  for (const [label, val] of spec.opts) {
-    const o = document.createElement('option');
-    o.value = val; o.textContent = label;
-    voiceSel.appendChild(o);
-  }
-  voiceSel.value = cfg[spec.key] || spec.opts[0][1];
-  speedSel.value = (cfg.speed && [...speedSel.options].some(o => o.value === cfg.speed)) ? cfg.speed : '1.0';
-  ttsState.textContent = cfg.tts ? 'ON' : 'OFF';
-  ttsToggle.classList.toggle('on', !!cfg.tts);
-  setToggleBtn(notifyBtn, cfg.notify);
-  setToggleBtn(appendBtn, cfg.append_when_off);
-  if (document.activeElement !== keepInp) keepInp.value = cfg.keep;
-  if (document.activeElement !== minInp) minInp.value = cfg.min_chars;
-  cfgSummary.textContent = (cfg.tts ? 'TTS on' : 'TTS off') + ' · '
-    + ENGINE_LABEL[engine] + ' · ' + voiceLabel(engine, voiceSel.value);
+function openStream(id){
+  if(es){ es.close(); es=null; }
+  es = new EventSource(`/events?session=${id}`);
+  es.onmessage = ev => {
+    let t; try{ t = JSON.parse(ev.data); }catch{ return; }
+    if(active!==id) return;
+    if(seen.has(t.id)){
+      // turn grew: refresh its body/audio in place
+      const card = $(`.turn[data-id="${cssEsc(t.id)}"]`);
+      if(card){ card.querySelector(".body").innerHTML = t.html||"";
+        if(t.audio_url) attachAudio(card, t.audio_url); }
+      return;
+    }
+    seen.add(t.id);
+    const card = renderTurn(t);
+    const thread = $("#thread");
+    const atBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+    thread.appendChild(card);
+    if(atBottom) thread.scrollTop = thread.scrollHeight;
+    if(t.audio_url){ enqueue(t.audio_url, card); }
+  };
+  es.onerror = () => { $("#liveDot").style.color="#888"; };
+  es.onopen = () => { $("#liveDot").style.color="var(--acc)"; };
 }
 
-function postCfg(updates) {
-  fetch('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(updates) })
-    .then(r => r.json()).then(c => { cfg = c; renderCfg(); flashSaved(); })
-    .catch(() => { cfgNote.textContent = 'Save failed — is the server up?'; });
+function enqueue(url, card){
+  if(!audioUnlocked) return;          // listen mode but audio not unlocked yet
+  queue.push({url, card}); pump();
+}
+function pump(){
+  if(playing || !queue.length) return;
+  const {url, card} = queue.shift(); playing = true;
+  const a = card.querySelector("audio") || attachAudio(card, url);
+  a.onended = () => { playing=false; pump(); };
+  a.play().catch(()=>{ playing=false; pump(); });
 }
 
-function flashSaved() {
-  cfgNote.textContent = 'Saved ✓ — applies to the next turn.';
-  setTimeout(() => { cfgNote.textContent = 'Applies to the next turn Bruce speaks.'; }, 1800);
-}
-
-cfgToggle.onclick = () => {
-  const open = !cfgPanel.classList.toggle('hidden');   // toggle returns true if now hidden
-  cfgToggle.classList.toggle('open', open);            // rotate the chevron when open
-};
-voiceSel.onchange = () => { const spec = VOICES[cfg.engine] || VOICES.openai; postCfg({ [spec.key]: voiceSel.value }); };
-speedSel.onchange = () => postCfg({ speed: speedSel.value });
-ttsToggle.onclick = () => postCfg({ tts: !cfg.tts });
-notifyBtn.onclick = () => postCfg({ notify: !cfg.notify });
-appendBtn.onclick = () => postCfg({ append_when_off: !cfg.append_when_off });
-keepInp.onchange = () => postCfg({ keep: parseInt(keepInp.value, 10) });
-minInp.onchange = () => postCfg({ min_chars: parseInt(minInp.value, 10) });
-restartBtn.onclick = () => {
-  if (!confirm('Restart the Bat-Speaker server? The page will reconnect in a few seconds.')) return;
-  cfgNote.textContent = 'Restarting server…';
-  fetch('/restart', { method: 'POST' }).catch(() => {});
-  setTimeout(() => location.reload(), 4000);
+// ---- iOS autoplay unlock ----
+$("#startBtn").onclick = async () => {
+  try{ unlockEl.src="/silence.mp3"; await unlockEl.play(); audioUnlocked=true;
+       $("#startBtn").textContent="🔈 On"; toast("Audio unlocked"); }
+  catch(e){ toast("Tap again to unlock audio"); }
 };
 
-fetch('/config').then(r => r.json()).then(c => { cfg = c; renderCfg(); }).catch(() => {});
+// ---- listen toggle ----
+$("#listenToggle").onchange = async e => {
+  if(!active) return;
+  const on = e.target.checked;
+  await fetch("/config", {method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({listen:{session:active, on}})});
+  const s = sessions.find(x=>x.id===active); if(s) s.listening = on;
+  renderTabs();
+  if(on && !audioUnlocked) toast("Tap ▶︎ Listen to allow audio");
+};
 
-// History loads immediately (display + tap-to-replay; does not auto-play).
-fetch('/state').then(r => r.json()).then(clips => {
-  currentHistory = clips;
-  renderHistory(clips);
-}).catch(() => {});
+// ---- settings ----
+async function loadConfig(){
+  const r = await fetch("/config"); const c = await r.json();
+  const vsel = $("#cfgVoice"); vsel.innerHTML="";
+  (c.voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
+    if(v===c.voice) o.selected=true; vsel.appendChild(o); });
+  $("#cfgEngine").value = c.engine||"openai";
+  $("#cfgSpeed").value = c.speed||"1.0";
+}
+$("#gearBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
+$("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
+$("#cfgSave").onclick = async ()=>{
+  await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
+                          speed:$("#cfgSpeed").value})});
+  toast("Saved"); $("#panel").classList.remove("open");
+};
+$("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
+  await fetch("/restart",{method:"POST"}); setTimeout(()=>location.reload(),4000); };
+$("#reloadBtn").onclick = loadSessions;
+
+function escapeHtml(s){ return (s||"").replace(/[&<>"]/g, c=>(
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function cssEsc(s){ return (window.CSS&&CSS.escape)?CSS.escape(s):s.replace(/"/g,'\\"'); }
+
+loadSessions();
+setInterval(loadSessions, 12000);    // pick up new conversations / reorder
 </script>
 </body>
 </html>
 """
 
 
-# ---------- HTTP handler ----------
+# ---------- HTTP ----------
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def log_message(self, *a):           # quiet; we print our own startup line
+    def log_message(self, *a):
         pass
 
     def handle_one_request(self):
-        # Mobile clients reset keep-alive / SSE connections constantly; that's
-        # normal, not an error — swallow it instead of dumping a traceback.
         try:
             super().handle_one_request()
         except (ConnectionResetError, BrokenPipeError):
@@ -631,101 +489,194 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), ctype="application/json")
+
+    def _query(self):
+        from urllib.parse import urlparse, parse_qs
+        return parse_qs(urlparse(self.path).query)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            return json.loads(self.rfile.read(n) or b"{}") if n else {}
+        except Exception:
+            return None
+
+    # ---- GET ----
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/":
             return self._send(200, PAGE)
-        if path == "/state":
-            return self._send(200, json.dumps(recent_clips()),
-                              ctype="application/json")
+        if path == "/sessions":
+            return self._json(200, self._sessions_payload())
+        if path == "/session":
+            q = self._query()
+            sid = (q.get("id") or [""])[0]
+            try:
+                n = int((q.get("n") or [DEFAULT_N])[0])
+            except ValueError:
+                n = DEFAULT_N
+            turns = session_turns(sid, max(1, min(n, 100)))
+            if turns is None:
+                return self._json(404, {"error": "unknown session"})
+            return self._json(200, turns)
         if path == "/config":
-            cfg = effective_cfg()
-            cfg["tts"] = tts_enabled()   # virtual field: the ~/.batspeaker-on toggle
-            return self._send(200, json.dumps(cfg), ctype="application/json")
+            cfg = core.load_config()
+            return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),
+                                    "speed": cfg.get("speed"), "voices": OPENAI_VOICES})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})
         if path == "/events":
             return self.stream_events()
-        if path.startswith("/clips/"):
-            return self.serve_clip(path[len("/clips/"):])
+        if path.startswith("/audio/"):
+            return self.serve_audio(path[len("/audio/"):])
         return self._send(404, "not found", ctype="text/plain")
 
+    # ---- POST ----
     def do_POST(self):
         path = self.path.split("?", 1)[0]
+        if path == "/tts":
+            body = self._body()
+            if not body:
+                return self._json(400, {"error": "bad json"})
+            return self._tts(body.get("session", ""), body.get("turn", ""))
         if path == "/config":
-            try:
-                n = int(self.headers.get("Content-Length", 0) or 0)
-                body = self.rfile.read(n) if n else b"{}"
-                updates = json.loads(body or b"{}")
-            except Exception:
-                return self._send(400, json.dumps({"error": "bad json"}),
-                                  ctype="application/json")
-            if "tts" in updates:                 # the on/off file, not config.json
-                set_tts(as_bool(updates.pop("tts")))
-            update_cfg(updates)
-            cfg = effective_cfg()
-            cfg["tts"] = tts_enabled()
-            return self._send(200, json.dumps(cfg), ctype="application/json")
+            body = self._body()
+            if body is None:
+                return self._json(400, {"error": "bad json"})
+            if "listen" in body and isinstance(body["listen"], dict):
+                sid = body["listen"].get("session", "")
+                if ID_RE.match(sid):
+                    set_listening(sid, bool(body["listen"].get("on")))
+            update_cfg({k: v for k, v in body.items() if k in EDITABLE})
+            cfg = core.load_config()
+            return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),
+                                    "speed": cfg.get("speed")})
         if path == "/restart":
-            self._send(200, json.dumps({"restarting": True}),
-                       ctype="application/json")
-            restart_service()                    # fires after the response flushes
+            self._json(200, {"restarting": True})
+            restart_service()
             return
         return self._send(404, "not found", ctype="text/plain")
 
-    # ---- SSE: stream only clips produced after this connection opened ----
+    # ---- helpers ----
+    def _sessions_payload(self):
+        out = []
+        for s in core.list_sessions():
+            out.append({"id": s["id"], "title": s["title"], "cwd": s["cwd"],
+                        "branch": s["branch"], "turns": s["turns"],
+                        "last_ts": s["last_ts"], "listening": is_listening(s["id"])})
+        return out
+
+    def _tts(self, session_id, turn_id):
+        if not (ID_RE.match(session_id or "") and turn_id):
+            return self._json(400, {"error": "bad request"})
+        path = core.session_path(session_id)
+        if not path:
+            return self._json(404, {"error": "unknown session"})
+        turn = next((t for t in core.parse_turns(path) if t["id"] == turn_id), None)
+        if not turn:
+            return self._json(404, {"error": "unknown turn"})
+        text = core.turn_spoken_text(turn)
+        if len(text.strip()) < 4:
+            return self._json(422, {"error": "nothing to speak"})
+        try:
+            _, dur = core.synth_turn(turn_id, text)
+        except Exception as ex:
+            return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
+        return self._json(200, {"url": f"/audio/{turn_id}.mp3", "duration": dur})
+
+    # ---- SSE: new turns for one conversation ----
     def stream_events(self):
+        q = self._query()
+        sid = (q.get("session") or [""])[0]
+        path = core.session_path(sid) if ID_RE.match(sid or "") else None
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
-        # Safari (and some mobile browsers) buffer an event-stream until ~2KB
-        # has arrived before dispatching ANY events — the connection looks open
-        # but nothing fires. A padding-comment prelude flushes that buffer.
+        # Flush Safari's stream buffer (it withholds events until ~2KB arrives).
         self.wfile.write(b": " + (b" " * 2048) + b"\n\n")
         self.wfile.write(b"retry: 3000\n\n")
         self.wfile.flush()
-        seen = {record_id(r) for r in iter_success_records()}   # ignore backlog
+        if not path:
+            return
+        seen = {t["id"] for t in core.parse_turns(path)}    # ignore the backlog
+        voiced = set()              # turns we've auto-synthesized in listen mode
+        STABLE = 4.0                # secs a turn must sit unchanged before we voice it
+        last_mtime = 0.0
+        changed_at = 0.0
         last_beat = time.time()
+
+        def emit(t):
+            data = json.dumps(turn_payload(t))   # turn_payload reflects cached audio
+            self.wfile.write(f"data: {data}\n\n".encode())
+            self.wfile.flush()
+
         try:
             while True:
-                fresh = [r for r in iter_success_records()
-                         if record_id(r) not in seen]
-                for r in fresh:
-                    seen.add(record_id(r))
-                    data = json.dumps(clip_payload(r))
-                    self.wfile.write(f"data: {data}\n\n".encode())
-                    self.wfile.flush()
-                if time.time() - last_beat > 15:
+                now = time.time()
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    mtime = last_mtime
+                turns = None
+                if mtime != last_mtime:
+                    last_mtime = mtime
+                    changed_at = now
+                    turns = core.parse_turns(path)
+                    for i, t in enumerate(turns):
+                        is_live = (i == len(turns) - 1)
+                        if t["id"] in seen and not is_live:
+                            continue       # settled turn already sent
+                        seen.add(t["id"])
+                        emit(t)   # text first, always
+                # Listen mode: voice a turn once it's sat unchanged for STABLE secs,
+                # so we never synthesize a half-written reply.
+                if is_listening(sid) and changed_at and (now - changed_at) > STABLE:
+                    if turns is None:
+                        turns = core.parse_turns(path)
+                    for t in turns:
+                        if t["id"] in voiced:
+                            continue
+                        voiced.add(t["id"])
+                        try:
+                            text = core.turn_spoken_text(t)
+                            if len(text.strip()) >= 4:
+                                core.synth_turn(t["id"], text)
+                                emit(t)   # now carries audio_url
+                        except Exception:
+                            pass
+                if now - last_beat > 15:
                     self.wfile.write(b": ping\n\n")
                     self.wfile.flush()
-                    last_beat = time.time()
-                time.sleep(1.0)
+                    last_beat = now
+                time.sleep(1.5)
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    # ---- audio with HTTP Range support (iOS Safari needs 206) ----
-    def serve_clip(self, name):
+    # ---- audio with Range (iOS Safari needs 206) ----
+    def serve_audio(self, name):
         name = os.path.basename(name)
-        if not MP3_RE.match(name):
+        m = re.match(r"^([A-Za-z0-9_-]+)\.mp3$", name)
+        if not m:
             return self._send(404, "not found", ctype="text/plain")
-        fpath = os.path.join(MP3_DIR, name)
+        fpath = core.audio_path_for(m.group(1))
         if not os.path.isfile(fpath):
             return self._send(404, "not found", ctype="text/plain")
         size = os.path.getsize(fpath)
         rng = self.headers.get("Range")
-        start, end = 0, size - 1
-        partial = False
+        start, end, partial = 0, size - 1, False
         if rng:
-            m = re.match(r"bytes=(\d*)-(\d*)", rng)
-            if m:
-                if m.group(1):
-                    start = int(m.group(1))
-                if m.group(2):
-                    end = int(m.group(2))
+            mm = re.match(r"bytes=(\d*)-(\d*)", rng)
+            if mm:
+                if mm.group(1):
+                    start = int(mm.group(1))
+                if mm.group(2):
+                    end = int(mm.group(2))
                 end = min(end, size - 1)
                 if start > end or start >= size:
                     self.send_response(416)
@@ -755,30 +706,26 @@ class Handler(BaseHTTPRequestHandler):
             return
 
 
-def tailnet_ip():
-    """Best-effort 100.x Tailscale address of this host."""
-    try:
-        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                             text=True, timeout=5).stdout.strip().splitlines()
-        return out[0] if out else None
-    except Exception:
-        return None
+def _last_id(path):
+    turns = core.parse_turns(path)
+    return turns[-1]["id"] if turns else None
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Bat-Speaker live listen server")
+    ap = argparse.ArgumentParser(description="Bat-Speaker v2 server")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
 
-    get_silence()   # warm the priming clip so the first Start tap is instant
+    _load_listen()
+    get_silence()
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True
 
     host = socket.gethostname()
     ip = tailnet_ip()
-    print("🔊 Bat-Speaker listen server")
+    print("🔊 Bat-Speaker v2 (transcript-driven)")
     print(f"   local : http://localhost:{args.port}")
     print(f"   host  : http://{host}:{args.port}")
     if ip:
