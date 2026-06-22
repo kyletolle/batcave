@@ -13,6 +13,8 @@ Designed to never block or break the CLI turn: always exits 0 on the hook path,
 and the slow work runs in a detached child process.
 """
 import sys, os, json, re, subprocess, time, glob, traceback
+import fcntl
+from contextlib import contextmanager
 
 VAULT = os.environ.get("BATSPEAKER_VAULT") or os.path.expanduser("~/vault")
 TOGGLE = os.path.expanduser("~/.batspeaker-on")
@@ -243,6 +245,37 @@ def read_existing_entries():
     return []
 
 
+NOTE_LOCK = NOTE + ".lock"
+
+
+@contextmanager
+def note_lock():
+    """Serialize the note's read-modify-write across concurrent session workers.
+
+    Without this, two sessions' Stop-hook workers race: both read the old note,
+    each prepends its own entry, and the last writer wins — silently erasing the
+    other turn. An flock on a sidecar file makes the read+write+prune atomic.
+    Best-effort: if locking fails we proceed unlocked rather than drop the turn.
+    """
+    fd = None
+    try:
+        fd = os.open(NOTE_LOCK, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        if fd is not None:
+            try: os.close(fd)
+            except Exception: pass
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try: fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception: pass
+            try: os.close(fd)
+            except Exception: pass
+
+
 def write_note(entries, keep):
     header = NOTE_HEADER.format(date=time.strftime("%Y-%m-%d"))
     blocks = "\n".join(f"\n{CLIP_SEP}\n{e}\n" for e in entries[:keep])
@@ -468,9 +501,10 @@ def worker(spoken_file, full_file=None, tts=True):
         entry = f"{head}\n{audio}{as_blockquote(full)}"
 
         try:
-            entries = [entry] + read_existing_entries()
-            write_note(entries, cfg["keep"])
-            prune_orphan_mp3s(entries[:cfg["keep"]])
+            with note_lock():
+                entries = [entry] + read_existing_entries()
+                write_note(entries, cfg["keep"])
+                prune_orphan_mp3s(entries[:cfg["keep"]])
         except Exception:
             jlog("worker", status="error", stage="write_note", mp3=fname,
                  tb=traceback.format_exc())
