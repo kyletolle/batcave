@@ -506,9 +506,15 @@ def synth(text, cfg=None, out=None):
     cfg = cfg or load_config()
     engine = cfg.get("engine", "openai")
     if engine == "openai":
+        # tts.sh reads OPENAI_API_KEY from its env, but the systemd-run server
+        # doesn't inherit it — inject from ~/.env.sh like the other engines do.
+        key = get_env("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY not found")
+        env = {**os.environ, "OPENAI_API_KEY": key}
         r = subprocess.run([TTS, "-v", cfg["voice"], "-m", cfg["model"],
                             "-s", str(cfg["speed"]), "-o", out],
-                           input=text, capture_output=True, text=True)
+                           input=text, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"tts rc={r.returncode}: {r.stderr.strip()[:200]}")
         return
