@@ -442,8 +442,41 @@ systemctl daemon-reload
 echo "ob-sync service created (not yet enabled — run ob login first)."
 echo ""
 
-# --- Step 16: (deprecated) moshi-notify system template ---
-echo "[16/17] moshi-notify deprecated — skipping (push API removed 2026-05-03)."
+# --- Step 16: failure alerting (moshi-notify@ template + OnFailure dropins) ---
+# When a critical unit fails, systemd fires moshi-notify@<unit>, which routes a
+# PagerDuty page via notify-failed-service.sh. Codified here so it survives a
+# server migration. (This drifted once: the template was hand-placed on the box
+# and silently lost when notify-failed-service.sh moved into the repo during the
+# code reorg — found 2026-06-23, alerting had been dead for ~5 services.)
+echo "[16/17] Wiring failure alerting (moshi-notify@ + OnFailure dropins)..."
+
+cat > /etc/systemd/system/moshi-notify@.service << UNIT
+[Unit]
+Description=PagerDuty alert for failed unit %i
+
+[Service]
+Type=oneshot
+User=${USERNAME}
+ExecStart=/bin/bash "/home/${USERNAME}/projects/batcave/vps/notify-failed-service.sh" "%i"
+UNIT
+
+# Wire OnFailure -> moshi-notify@ on each critical system service that's present.
+# Idempotent and guarded, so a missing optional service doesn't break provisioning.
+# (User services like qmd-mcp / mempalace-mine carry their own dropins in their
+# respective setup scripts — those live under ~/.config/systemd/user/.)
+for unit in ob-sync earlyoom netdata; do
+  if systemctl list-unit-files "${unit}.service" >/dev/null 2>&1; then
+    mkdir -p "/etc/systemd/system/${unit}.service.d"
+    cat > "/etc/systemd/system/${unit}.service.d/onfailure.conf" << 'DROPIN'
+[Unit]
+OnFailure=moshi-notify@%n.service
+DROPIN
+    echo "  wired OnFailure -> moshi-notify@ for ${unit}.service"
+  fi
+done
+
+systemctl daemon-reload
+echo "  failure alerting wired (ob-sync, earlyoom, netdata as present)."
 echo ""
 
 # --- User environment setup ---
