@@ -2,6 +2,14 @@
 source ~/.env.sh
 cd ~/vault
 
+# Channels (Telegram plugin) require claude.ai subscription auth, NOT API-key
+# auth. ~/.env.sh exports ANTHROPIC_API_KEY, which would force API-key mode and
+# silently disable --channels ("Channels are not currently available"). Drop it
+# so claude falls back to subscription login (~/.claude/.credentials.json).
+# Bonus: stops interactive sessions from billing the API account.
+# Bash-tool scripts still get the key — the ~/.local/bin wrappers re-source it.
+unset ANTHROPIC_API_KEY
+
 # Kill orphan Telegram plugin processes from previous sessions
 # (only one bot polling connection allowed; orphans steal messages)
 pkill -f "external_plugins/telegram.*start" 2>/dev/null
