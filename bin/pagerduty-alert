@@ -2,7 +2,17 @@
 # Send a PagerDuty alert via Events API v2.
 # Usage: pagerduty-alert "Summary" [severity] [source]
 #   severity: critical (default), error, warning, info
-#   source: hostname (default)
+#   source:   hostname (default)
+#
+# De-dup / lifecycle options (may appear anywhere in the args):
+#   -k, --dedup-key KEY   stable key to group repeated triggers into ONE incident
+#                         and to later resolve it
+#   -r, --resolve         shorthand for --action resolve
+#   -a, --action ACTION   trigger (default) | resolve | acknowledge
+#
+# With a dedup key, repeated triggers update the same incident instead of
+# spawning new ones, and `--resolve -k KEY` auto-closes it on recovery.
+# Backward compatible: positional "Summary" [severity] [source] still works.
 
 set -euo pipefail
 
@@ -13,22 +23,46 @@ if [[ -z "${PAGER_DUTY_API_KEY:-}" ]]; then
     exit 1
 fi
 
-SUMMARY="${1:-Alert from $(hostname)}"
-SEVERITY="${2:-critical}"
-SOURCE="${3:-$(hostname)}"
+DEDUP_KEY=""
+ACTION="trigger"
+POS=()
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -k|--dedup-key) DEDUP_KEY="$2"; shift 2 ;;
+        -r|--resolve)   ACTION="resolve"; shift ;;
+        -a|--action)    ACTION="$2"; shift 2 ;;
+        *)              POS+=("$1"); shift ;;
+    esac
+done
+
+SUMMARY="${POS[0]:-Alert from $(hostname)}"
+SEVERITY="${POS[1]:-critical}"
+SOURCE="${POS[2]:-$(hostname)}"
+
+if [[ "$ACTION" == "resolve" || "$ACTION" == "acknowledge" ]]; then
+    if [[ -z "$DEDUP_KEY" ]]; then
+        echo "Error: --$ACTION requires --dedup-key." >&2
+        exit 1
+    fi
+    DATA=$(jq -n --arg key "$PAGER_DUTY_API_KEY" --arg dk "$DEDUP_KEY" --arg action "$ACTION" \
+        '{routing_key: $key, dedup_key: $dk, event_action: $action}')
+else
+    DATA=$(jq -n \
+        --arg summary "$SUMMARY" --arg severity "$SEVERITY" --arg source "$SOURCE" \
+        --arg key "$PAGER_DUTY_API_KEY" --arg dk "$DEDUP_KEY" \
+        '{payload: {summary: $summary, severity: $severity, source: $source},
+          routing_key: $key, event_action: "trigger"}
+         + (if $dk == "" then {} else {dedup_key: $dk} end)')
+fi
 
 RESPONSE=$(curl -s --request POST \
     --url 'https://events.pagerduty.com/v2/enqueue' \
     --header 'Content-Type: application/json' \
-    --data "$(jq -n \
-        --arg summary "$SUMMARY" \
-        --arg severity "$SEVERITY" \
-        --arg source "$SOURCE" \
-        --arg key "$PAGER_DUTY_API_KEY" \
-        '{payload: {summary: $summary, severity: $severity, source: $source}, routing_key: $key, event_action: "trigger"}')")
+    --data "$DATA")
 
 if echo "$RESPONSE" | jq -e '.status == "success"' > /dev/null 2>&1; then
-    echo "PagerDuty: $SUMMARY"
+    DK=$(echo "$RESPONSE" | jq -r '.dedup_key // empty')
+    echo "PagerDuty[$ACTION]: ${SUMMARY}${DK:+ (dedup_key=$DK)}"
 else
     echo "PagerDuty failed: $RESPONSE" >&2
     exit 1
