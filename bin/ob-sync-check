@@ -3,7 +3,7 @@
 # ob-sync logs "Fully synced" every ~30s when connected. A gap longer than
 # WINDOW_HOURS means the connection is dead or stuck.
 #
-# Run hourly via ob-sync-check.timer. Alerts via moshi.
+# Run hourly via ob-sync-check.timer. Alerts via moshi-notify (getmoshi.app push).
 
 WINDOW_HOURS=2
 
@@ -13,9 +13,9 @@ recent_count=$(journalctl -u ob-sync.service --since "${WINDOW_HOURS} hours ago"
 
 if [ "$recent_count" -eq 0 ]; then
     if ! systemctl is-active --quiet ob-sync.service 2>/dev/null; then
-        moshi "ob-sync Alert" "ob-sync.service is not running — Obsidian Sync is down."
+        moshi-notify "ob-sync Alert" "ob-sync.service is not running — Obsidian Sync is down."
     else
-        moshi "ob-sync Alert" "ob-sync running but no heartbeat in ${WINDOW_HOURS}h — connection may be stuck."
+        moshi-notify "ob-sync Alert" "ob-sync running but no heartbeat in ${WINDOW_HOURS}h — connection may be stuck."
     fi
 fi
 

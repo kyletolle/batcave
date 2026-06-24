@@ -136,6 +136,14 @@ else
   echo "$WARN not enabled (run ob login first)"
 fi
 
+printf "  %-35s " "failure alerting (moshi-notify@)"
+if systemctl cat moshi-notify@.service >/dev/null 2>&1 \
+   && [ -f /etc/systemd/system/ob-sync.service.d/onfailure.conf ]; then
+  echo "$PASS template + ob-sync OnFailure dropin present"
+else
+  echo "$WARN moshi-notify@ template or OnFailure dropin missing"
+fi
+
 # --- SSH config ---
 echo ""
 echo "--- SSH Hardening ---"
