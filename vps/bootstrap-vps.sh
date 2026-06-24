@@ -335,11 +335,42 @@ Environment=PATH=/home/kyle/.local/bin:/usr/local/bin:/usr/bin:/bin
 WantedBy=default.target
 UNIT
 
+# ob-sync watchdog — heartbeat check (detects a stalled headless sync,
+# self-heals via restart, escalates with quiet-hours gating). Pairs with
+# bin/ob-sync-check.
+cat > "$SYSTEMD_USER_DIR/ob-sync-check.service" << 'UNIT'
+[Unit]
+Description=Check ob-sync heartbeat via journal
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/kyle/.local/bin/ob-sync-check
+Environment=HOME=/home/kyle
+Environment=PATH=/home/kyle/.bun/bin:/home/kyle/.local/bin:/usr/local/bin:/usr/bin:/bin
+UNIT
+
+# Run every 5 min, 24/7. The check has its own quiet-hours gate (soft notices are
+# non-waking; critical pages queue to 08:00), so the timer must NOT be disabled
+# overnight — doing that on 2026-06-23 left a ~7h stall undetected the next morning.
+cat > "$SYSTEMD_USER_DIR/ob-sync-check.timer" << 'UNIT'
+[Unit]
+Description=ob-sync heartbeat check (every 5 min)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+UNIT
+
 systemctl --user daemon-reload
 # Enable but don't start until migration/sync is complete
-systemctl --user enable qmd-mcp.service qmd-embed.timer batspeaker-serve.service 2>/dev/null || true
-echo "QMD + batspeaker systemd services created and enabled."
-echo "Start with: systemctl --user start qmd-mcp qmd-embed.timer batspeaker-serve"
+systemctl --user enable qmd-mcp.service qmd-embed.timer batspeaker-serve.service ob-sync-check.timer 2>/dev/null || true
+echo "QMD + batspeaker + ob-sync watchdog systemd services created and enabled."
+echo "Start with: systemctl --user start qmd-mcp qmd-embed.timer batspeaker-serve ob-sync-check.timer"
 echo ""
 
 # --- Step 8: (deprecated) moshi-notify user template ---
@@ -522,6 +553,9 @@ check "QMD reranker patched" "grep -q 'rerank: false' \"\$(find ~/.bun ~/.npm-gl
 check "QMD MCP service" "test -f $HOME/.config/systemd/user/qmd-mcp.service"
 check "QMD embed timer" "test -f $HOME/.config/systemd/user/qmd-embed.timer"
 check "batspeaker-serve service" "test -f $HOME/.config/systemd/user/batspeaker-serve.service"
+check "ob-sync watchdog service" "test -f $HOME/.config/systemd/user/ob-sync-check.service"
+check "ob-sync watchdog timer" "test -f $HOME/.config/systemd/user/ob-sync-check.timer"
+check "ob-sync watchdog timer active" "systemctl --user is-active --quiet ob-sync-check.timer 2>/dev/null"
 check "ccusage cron job" "crontab -l 2>/dev/null | grep -q ccusage_daily_log"
 check "disk-watch cron job" "crontab -l 2>/dev/null | grep -q disk-watch"
 check "moshi-hook installed" "command -v moshi-hook"
