@@ -1,26 +1,145 @@
 #!/bin/bash
-# Check that ob-sync is actively syncing via journal heartbeats.
-# ob-sync logs "Fully synced" every ~30s when connected. A gap longer than
-# WINDOW_HOURS means the connection is dead or stuck.
+# ob-sync watchdog — detect a stalled Obsidian headless sync, self-heal, escalate.
 #
-# Run hourly via ob-sync-check.timer. Alerts via moshi-notify (getmoshi.app push).
+# Signal: ob-sync logs "Fully synced" every ~30s while connected. We measure the
+# AGE of the most recent heartbeat (not "any in a window"), so a fresh stall is
+# caught within one tick.
+#
+# Lifecycle (run every 5 min via ob-sync-check.timer):
+#   healthy (age < STALL_MIN)      -> clear any incident; resolve PD; ping healthcheck
+#   stalled, restarts remaining    -> restart ob-sync, soft-notify (Moshi + Slack)
+#   stalled, restarts exhausted    -> escalate loud (PagerDuty), once
+#                                     quiet hours -> hold, flush at QUIET_END
+#
+# Channels: soft = moshi-notify + slack-notify (best-effort). loud = pagerduty-alert
+# with a stable dedup key, so repeats update one incident and recovery resolves it.
+# Single page by design — no script re-page; PagerDuty's escalation policy owns
+# reminders, and acking it stops them.
 
-WINDOW_HOURS=2
+HOST="$(hostname)"
+SERVICE="ob-sync.service"
+HEARTBEAT="Fully synced"
 
-# Count "Fully synced" events in the lookback window
-recent_count=$(journalctl -u ob-sync.service --since "${WINDOW_HOURS} hours ago" \
-    --no-pager -q 2>/dev/null | grep -c "Fully synced" || echo 0)
+STALL_MIN=10            # minutes of heartbeat silence = stalled
+MAX_RESTARTS=3         # self-heal attempts before escalating
+QUIET_START=21         # quiet hours begin (local hour, inclusive)
+QUIET_END=8            # quiet hours end (local hour, exclusive)
+TZLOCAL="America/Denver"
+DEDUP_KEY="${HOST}/ob-sync-stall"
+SOURCE="${HOST}/ob-sync"
+STATE_FILE="$HOME/.local/state/ob-sync-watchdog.json"
 
-if [ "$recent_count" -eq 0 ]; then
-    if ! systemctl is-active --quiet ob-sync.service 2>/dev/null; then
-        moshi-notify "ob-sync Alert" "ob-sync.service is not running — Obsidian Sync is down."
-    else
-        moshi-notify "ob-sync Alert" "ob-sync running but no heartbeat in ${WINDOW_HOURS}h — connection may be stuck."
-    fi
-fi
+# Test hooks: OBSYNC_DRY_RUN=1 prints actions instead of doing them;
+# OBSYNC_FORCE_AGE=<min> overrides the measured heartbeat age.
+DRY_RUN="${OBSYNC_DRY_RUN:-}"
 
-# Optional: ping healthchecks.io on success (set HEALTHCHECKS_OBSYNC_URL in ~/.env.sh)
 source "$HOME/.env.sh" 2>/dev/null || true
-if [ -n "$HEALTHCHECKS_OBSYNC_URL" ] && [ "$recent_count" -gt 0 ]; then
-    curl -fsS -m 10 "$HEALTHCHECKS_OBSYNC_URL" > /dev/null 2>&1 || true
+mkdir -p "$(dirname "$STATE_FILE")"
+
+# --- helpers ---------------------------------------------------------------
+soft_notify() {  # title, message — best-effort to both soft channels
+    if [ -n "$DRY_RUN" ]; then echo "[dry-run] soft-notify: $1 — $2"; return; fi
+    moshi-notify "$1" "$2" >/dev/null 2>&1 || true
+    slack-notify "$1" "$2" >/dev/null 2>&1 || true
+}
+
+do_restart() {
+    if [ -n "$DRY_RUN" ]; then echo "[dry-run] restart $SERVICE"; return; fi
+    systemctl restart "$SERVICE" 2>/dev/null || sudo systemctl restart "$SERVICE" 2>/dev/null || true
+}
+
+page() {  # summary
+    if [ -n "$DRY_RUN" ]; then echo "[dry-run] PAGE (PagerDuty critical, dedup=$DEDUP_KEY): $1"; return; fi
+    pagerduty-alert "$1" critical "$SOURCE" -k "$DEDUP_KEY" >/dev/null 2>&1
+}
+
+resolve_page() {
+    if [ -n "$DRY_RUN" ]; then echo "[dry-run] RESOLVE PagerDuty (dedup=$DEDUP_KEY)"; return; fi
+    pagerduty-alert --resolve -k "$DEDUP_KEY" >/dev/null 2>&1 || true
+}
+
+state_get() {  # key, default
+    [ -f "$STATE_FILE" ] || { echo "$2"; return; }
+    local v; v=$(jq -r --arg k "$1" '.[$k] // empty' "$STATE_FILE" 2>/dev/null)
+    [ -n "$v" ] && echo "$v" || echo "$2"
+}
+
+state_clear() { rm -f "$STATE_FILE"; }
+
+state_set() {  # incident incident_start restart_count escalated queued
+    jq -n --argjson inc "$1" --argjson st "$2" --argjson rc "$3" \
+          --argjson esc "$4" --argjson q "$5" \
+        '{incident:$inc, incident_start:$st, restart_count:$rc, escalated:$esc, queued:$q}' \
+        > "$STATE_FILE"
+}
+
+is_quiet() {  # 0 = quiet hours, 1 = not
+    local h; h=$(TZ="$TZLOCAL" date +%-H)
+    if [ "$h" -ge "$QUIET_START" ] || [ "$h" -lt "$QUIET_END" ]; then return 0; else return 1; fi
+}
+
+# --- measure heartbeat age -------------------------------------------------
+now=$(date +%s)
+last_ts=$(journalctl -u "$SERVICE" --since "2 hours ago" -o short-unix --no-pager -q 2>/dev/null \
+            | grep -F "$HEARTBEAT" | tail -1 | awk '{print $1}')
+if [ -z "$last_ts" ]; then
+    age_min=999                                   # no heartbeat in 2h = stalled
+else
+    age_min=$(( (now - ${last_ts%.*}) / 60 ))
 fi
+age_min="${OBSYNC_FORCE_AGE:-$age_min}"
+
+# --- read incident state ---------------------------------------------------
+incident=$(state_get incident false)
+incident_start=$(state_get incident_start "$now")
+restart_count=$(state_get restart_count 0)
+escalated=$(state_get escalated false)
+queued=$(state_get queued false)
+
+# ===========================================================================
+if [ "$age_min" -lt "$STALL_MIN" ]; then
+    # ---- HEALTHY ----
+    if [ "$incident" = "true" ]; then
+        down_min=$(( (now - incident_start) / 60 ))
+        soft_notify "ob-sync recovered" \
+            "Sync healthy again after ${restart_count} restart(s); was down ~${down_min}m."
+        [ "$escalated" = "true" ] && resolve_page
+        state_clear
+    fi
+    # liveness ping on success (optional)
+    if [ -z "$DRY_RUN" ] && [ -n "$HEALTHCHECKS_OBSYNC_URL" ]; then
+        curl -fsS -m 10 "$HEALTHCHECKS_OBSYNC_URL" >/dev/null 2>&1 || true
+    fi
+    [ -n "$DRY_RUN" ] && echo "[dry-run] healthy (age ${age_min}m) — incident cleared if any"
+    exit 0
+fi
+
+# ---- STALLED ----
+if [ "$incident" != "true" ]; then
+    incident=true; incident_start=$now; restart_count=0; escalated=false; queued=false
+fi
+
+if [ "$restart_count" -lt "$MAX_RESTARTS" ]; then
+    # self-heal
+    do_restart
+    restart_count=$(( restart_count + 1 ))
+    soft_notify "ob-sync stalled" \
+        "No heartbeat for ${age_min}m — restart attempt ${restart_count}/${MAX_RESTARTS}."
+else
+    # restarts exhausted -> escalate loud, respecting quiet hours
+    if [ "$escalated" != "true" ]; then
+        if is_quiet && [ "$queued" != "true" ]; then
+            queued=true
+            soft_notify "ob-sync down (quiet hours)" \
+                "${MAX_RESTARTS} restarts failed; PagerDuty held until ${QUIET_END}:00."
+        elif ! is_quiet; then
+            # daytime, or morning flush of an overnight-queued incident
+            page "ob-sync stalled on ${HOST} — ${age_min}m down, ${MAX_RESTARTS} restarts failed"
+            escalated=true; queued=false
+        fi
+    fi
+    # already escalated -> nothing: single page, PD owns reminders, dedup = no new incidents
+fi
+
+state_set "$incident" "$incident_start" "$restart_count" "$escalated" "$queued"
+exit 0

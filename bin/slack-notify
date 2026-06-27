@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Send a Slack message via chat.postMessage.
+# Usage: slack-notify "Message"
+#        slack-notify "Title" "Message"        (title rendered bold on its own line)
+#        slack-notify -c CHANNEL -m "Message"  (override channel; id or #name)
+#
+# Channel defaults to SLACK_ALERT_CHANNEL, else #main (C0AD7LATYLU).
+# Requires SLACK_BOT_TOKEN in ~/.env.sh and the bot to be a member of the channel
+# (in Slack: /invite @<bot>). A non-member channel returns not_in_channel.
+
+set -euo pipefail
+
+[[ -f "$HOME/.env.sh" ]] && source "$HOME/.env.sh"
+
+if [[ -z "${SLACK_BOT_TOKEN:-}" ]]; then
+    echo "Error: SLACK_BOT_TOKEN not set." >&2
+    exit 1
+fi
+
+CHANNEL="${SLACK_ALERT_CHANNEL:-C0AD7LATYLU}"
+TITLE=""
+MESSAGE=""
+
+if [[ "${1:-}" == "-c" || "${1:-}" == "-m" ]]; then
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            -c|--channel) CHANNEL="$2"; shift 2 ;;
+            -m|--message) MESSAGE="$2"; shift 2 ;;
+            -t|--title)   TITLE="$2"; shift 2 ;;
+            *) echo "Unknown flag: $1" >&2; exit 1 ;;
+        esac
+    done
+elif [[ "$#" -eq 2 ]]; then
+    TITLE="$1"; MESSAGE="$2"
+elif [[ "$#" -eq 1 ]]; then
+    MESSAGE="$1"
+else
+    echo "Usage: slack-notify \"Message\"  |  slack-notify \"Title\" \"Message\"" >&2
+    exit 1
+fi
+
+if [[ -z "$MESSAGE" ]]; then
+    echo "Error: message is required" >&2
+    exit 1
+fi
+
+TEXT="$MESSAGE"
+[[ -n "$TITLE" ]] && TEXT="*${TITLE}*"$'\n'"${MESSAGE}"
+
+RESPONSE=$(curl -s -X POST https://slack.com/api/chat.postMessage \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    --data "$(jq -n --arg ch "$CHANNEL" --arg text "$TEXT" \
+        '{channel: $ch, text: $text}')")
+
+if echo "$RESPONSE" | jq -e '.ok' > /dev/null 2>&1; then
+    echo "Slack: sent to $CHANNEL"
+else
+    echo "Slack failed: $(echo "$RESPONSE" | jq -r '.error // .')" >&2
+    exit 1
+fi
