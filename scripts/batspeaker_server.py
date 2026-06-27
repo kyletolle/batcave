@@ -192,6 +192,7 @@ PAGE = r"""<!DOCTYPE html>
            padding-top:max(.55rem, env(safe-area-inset-top)); }
   header .title { font-weight:700; color:var(--acc); letter-spacing:.2px; }
   header .sp { flex:1; }
+  header .dot { font-size:.7rem; color:#888; }
   button { font:inherit; color:var(--fg); background:var(--panel2);
            border:1px solid var(--line); border-radius:.5rem; padding:.35rem .6rem;
            cursor:pointer; }
@@ -207,7 +208,8 @@ PAGE = r"""<!DOCTYPE html>
   .tab.active { border-color:var(--acc); color:var(--acc); }
   .tab .cnt { color:var(--mut); font-size:.78rem; margin-left:.35rem; }
   .tab .ear { margin-left:.3rem; }
-  #thread { flex:1; overflow-y:auto; padding:.7rem .7rem 4rem;
+  #thread { flex:1; overflow-y:auto;
+            padding:.7rem .7rem max(.9rem, env(safe-area-inset-bottom));
             -webkit-overflow-scrolling:touch; }
   .turn { background:var(--panel); border:1px solid var(--line);
           border-radius:.7rem; padding:.7rem .8rem; margin:0 auto .8rem; max-width:760px; }
@@ -226,12 +228,11 @@ PAGE = r"""<!DOCTYPE html>
   .speak { font-size:.85rem; }
   .speak.busy { opacity:.5; }
   .sub { color:var(--mut); font-size:.78rem; }
-  #bar { position:sticky; bottom:0; display:flex; align-items:center; gap:.6rem;
-         padding:.55rem .7rem; padding-bottom:max(.55rem, env(safe-area-inset-bottom));
-         background:var(--panel); border-top:1px solid var(--line); }
-  #bar .grow { flex:1; }
-  .switch { display:inline-flex; align-items:center; gap:.4rem; font-size:.86rem; }
+  .switch { display:inline-flex; align-items:center; gap:.5rem; font-size:.95rem; }
   .switch input { width:38px; height:22px; }
+  #panel .sect { color:var(--mut); font-size:.78rem; text-transform:uppercase;
+                 letter-spacing:.4px; margin:1rem 0 .35rem; }
+  #panel .sect:first-of-type { margin-top:.4rem; }
   #panel { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none;
            align-items:flex-end; z-index:20; }
   #panel.open { display:flex; }
@@ -241,7 +242,7 @@ PAGE = r"""<!DOCTYPE html>
   #panel select, #panel input[type=number] { width:100%; padding:.45rem; background:var(--panel2);
        color:var(--fg); border:1px solid var(--line); border-radius:.45rem; }
   .empty { color:var(--mut); text-align:center; margin-top:3rem; }
-  .toast { position:fixed; left:50%; bottom:5rem; transform:translateX(-50%);
+  .toast { position:fixed; left:50%; bottom:2.5rem; transform:translateX(-50%);
            background:#2a2f3a; border:1px solid var(--line); padding:.5rem .8rem;
            border-radius:.5rem; opacity:0; transition:opacity .2s; pointer-events:none; }
   .toast.show { opacity:1; }
@@ -252,21 +253,20 @@ PAGE = r"""<!DOCTYPE html>
   <span class="title">🔊 Bat-Speaker</span>
   <span class="sub" id="now"></span>
   <span class="sp"></span>
-  <button class="icon" id="startBtn" title="Unlock audio">▶︎ Listen</button>
-  <button class="icon" id="gearBtn" title="Settings">⚙</button>
-  <button class="icon" id="reloadBtn" title="Refresh tabs">↻</button>
+  <span class="dot" id="liveDot" title="Live connection">●</span>
+  <button class="icon" id="menuBtn" title="Menu">☰</button>
 </header>
 <div id="tabs"></div>
 <div id="thread"><div class="empty">Pick a conversation above.</div></div>
-<div id="bar">
-  <label class="switch"><input type="checkbox" id="listenToggle">
-    <span>Auto-speak this conversation</span></label>
-  <span class="grow"></span>
-  <span class="sub" id="liveDot">●</span>
-</div>
 
 <div id="panel"><div class="card">
-  <strong>Voice settings</strong>
+  <div class="sect">Audio</div>
+  <button id="startBtn" title="Unlock audio">▶︎ Listen (unlock audio)</button>
+  <label class="switch" style="margin-top:.7rem;">
+    <input type="checkbox" id="listenToggle">
+    <span>Auto-speak this conversation</span></label>
+
+  <div class="sect">Voice</div>
   <label>Engine</label>
   <select id="cfgEngine">
     <option value="openai">OpenAI</option>
@@ -277,13 +277,19 @@ PAGE = r"""<!DOCTYPE html>
   <select id="cfgVoice"></select>
   <label>Speed</label>
   <input type="number" id="cfgSpeed" min="0.5" max="3" step="0.05">
-  <div class="row" style="margin-top:1rem;">
+  <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize.</p>
+
+  <div class="sect">Actions</div>
+  <div class="row">
+    <button id="reloadBtn">↻ Refresh tabs</button>
+    <button id="cfgRestart">Restart server</button>
+  </div>
+
+  <div class="row" style="margin-top:1.2rem;">
     <button id="cfgSave">Save</button>
     <span class="grow"></span>
-    <button id="cfgRestart">Restart server</button>
     <button id="panelClose">Close</button>
   </div>
-  <p class="sub">Voice changes apply to the next turn you synthesize.</p>
 </div></div>
 
 <div class="toast" id="toast"></div>
@@ -440,7 +446,7 @@ async function loadConfig(){
   $("#cfgEngine").value = c.engine||"openai";
   $("#cfgSpeed").value = c.speed||"1.0";
 }
-$("#gearBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
+$("#menuBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
 $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
 $("#cfgSave").onclick = async ()=>{
   await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
@@ -450,7 +456,7 @@ $("#cfgSave").onclick = async ()=>{
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
   await fetch("/restart",{method:"POST"}); setTimeout(()=>location.reload(),4000); };
-$("#reloadBtn").onclick = loadSessions;
+$("#reloadBtn").onclick = ()=>{ loadSessions(); $("#panel").classList.remove("open"); };
 
 function escapeHtml(s){ return (s||"").replace(/[&<>"]/g, c=>(
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
