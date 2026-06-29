@@ -1054,6 +1054,7 @@ def cmd_bulk(args):
       {"op":"update","id":"...","content":"...","priority":N,
        "description":"...","due":"...","deadline":"..."}
       {"op":"move-section","id":"...","section":"Name"}   # section in task's own project
+      {"op":"move-parent","id":"...","parent":"ID"}       # nest task under parent (same project)
 
     'add' defaults to the Batcave project when 'project' is omitted. Every op is
     logged with extra.bulk=true and its index. Failing ops are reported and
@@ -1146,6 +1147,25 @@ def cmd_bulk(args):
                     log_mutation("move-section", task_before=before, task_after=after,
                                  extra={"bulk": True, "bulk_index": i, "target_section": sec["name"]})
                     print(f"  [{i}] moved: '{task['content']}' → '{sec['name']}'")
+
+            elif kind == "move-parent":
+                task = task_by_id.get(op.get("id"))
+                if not task:
+                    raise ValueError(f"task {op.get('id')} not found")
+                parent = task_by_id.get(op.get("parent"))
+                if not parent:
+                    raise ValueError(f"parent task {op.get('parent')} not found")
+                if dry:
+                    print(f"  [{i}] reparent {op['id']} → under '{parent['content']}'")
+                else:
+                    before = dict(task)
+                    api_post(f"tasks/{op['id']}/move", {"parent_id": op["parent"]})
+                    after = dict(task)
+                    after["parent_id"] = op["parent"]
+                    log_mutation("move-parent", task_before=before, task_after=after,
+                                 extra={"bulk": True, "bulk_index": i,
+                                        "target_parent": parent["content"]})
+                    print(f"  [{i}] reparented: '{task['content']}' → under '{parent['content']}'")
 
             else:
                 raise ValueError(f"unknown op '{kind}'")
