@@ -5,13 +5,17 @@ Sleep Tracker Field Writer
 Surgically updates sleep tracker fields in the appropriate weekly note.
 Replaces the manual Edit-tool dance in /sleep-evening and /sleep-morning.
 
-Six fields per day (matching the weekly-note template):
+Fields per day (matching the weekly-note template):
     --bed         "Night before, what time getting into bed:"
     --eyes        "Night before, what time closing eyes:"
     --wake        "Morning of, what time getting up:"
     --hours       "Hours of Sleep:"
     --energy      "Night of, what was energy level today from 1 to 10:"
-    --correlation "Correlate energy level with sleep previous night:"
+    --correlation "Correlate energy level with sleep previous night:"  (rows before 2026-07-03)
+    --agency      "Night of, what agency did I have today (...):"      (rows from 2026-07-03 on)
+
+A day's row has one of --correlation / --agency, never both; writing the
+flag the row doesn't carry reports a "field not found" conflict.
 
 Date selection:
     --date today | tomorrow | yesterday | YYYY-MM-DD     (default: today)
@@ -51,6 +55,7 @@ FIELDS = [
     ("hours",       "Hours of Sleep:"),
     ("energy",      "Night of, what was energy level today from 1 to 10:"),
     ("correlation", "Correlate energy level with sleep previous night:"),
+    ("agency",      "Night of, what agency did I have today (something of my own, or none):"),
 ]
 FIELD_BY_FLAG = {flag: label for flag, label in FIELDS}
 
