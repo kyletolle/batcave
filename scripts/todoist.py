@@ -11,6 +11,7 @@ Usage:
     todoist.py update TASK_ID [options]          Update a task (supports --deadline, --no-deadline)
     todoist.py postpone TASK_ID DATE             Reschedule (recurring or one-off)
     todoist.py complete TASK_ID                  Complete a task
+    todoist.py uncomplete TASK_ID                Reopen a completed task (undo)
     todoist.py search QUERY                      Search tasks by content
     todoist.py sections [--project NAME]         List sections in a project
     todoist.py add-section NAME [--project NAME] Create a new section
@@ -797,6 +798,18 @@ def cmd_complete(args):
         print(f"  (cascade-completed {len(children)} subtask(s))")
 
 
+def cmd_uncomplete(args):
+    """Reopen a completed task (undo a complete). Completed tasks aren't returned
+    by the active-tasks endpoint, so reopen first, then fetch for the snapshot."""
+    api_post(f"tasks/{args.task_id}/reopen")
+    task = next((t for t in api_get("tasks") if t["id"] == args.task_id), None)
+    log_mutation("uncomplete", task_after=task, extra={"task_id": args.task_id})
+    if task:
+        print(f"Reopened: {task['content']} (id: {args.task_id})")
+    else:
+        print(f"Reopened task {args.task_id}.")
+
+
 def cmd_search(args):
     pmap = project_map()
 
@@ -1363,6 +1376,9 @@ def main():
     p_complete.add_argument("task_id", help="Task ID to complete")
     p_complete.add_argument("--cascade", action="store_true", help="Confirm cascade-completing all subtasks")
 
+    p_uncomplete = sub.add_parser("uncomplete", help="Reopen a completed task (undo a complete)")
+    p_uncomplete.add_argument("task_id", help="Task ID to reopen")
+
     # search
     p_search = sub.add_parser("search", help="Search tasks by content")
     p_search.add_argument("query", help="Search query")
@@ -1439,6 +1455,7 @@ def main():
         "update": cmd_update,
         "postpone": cmd_postpone,
         "complete": cmd_complete,
+        "uncomplete": cmd_uncomplete,
         "search": cmd_search,
         "sections": cmd_sections,
         "add-section": cmd_add_section,
