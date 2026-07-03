@@ -237,12 +237,14 @@ def _light_session_meta(path):
                     branch = e["gitBranch"]
                 if e.get("sessionId"):
                     session_id = e["sessionId"]
-                if e.get("timestamp"):
-                    last_ts = e["timestamp"]
                 if is_real_user(e):
                     turn_count += 1
                     if first_prompt is None:
                         first_prompt = _user_text(e)
+                    if e.get("timestamp"):
+                        last_ts = e["timestamp"]
+                elif e.get("type") == "assistant" and e.get("timestamp"):
+                    last_ts = e["timestamp"]
     except Exception:
         return None
     if turn_count == 0:
@@ -261,8 +263,9 @@ def _light_session_meta(path):
 
 
 def list_sessions(active_within_hours=48, limit=40):
-    """All Claude Code sessions on the box with real turns, newest activity
-    first. `active_within_hours` filters by file mtime; None disables it."""
+    """All Claude Code sessions on the box with real turns, most recently
+    conversed-in first. `active_within_hours` filters by file mtime; None
+    disables it."""
     metas = []
     cutoff = time.time() - active_within_hours * 3600 if active_within_hours else None
     for path in glob.glob(os.path.join(PROJECTS_ROOT, "*", "*.jsonl")):
@@ -274,7 +277,9 @@ def list_sessions(active_within_hours=48, limit=40):
         m = _light_session_meta(path)
         if m:
             metas.append(m)
-    metas.sort(key=lambda m: m["mtime"], reverse=True)
+    # Order by the last real conversation message, not file mtime — transcripts
+    # get touched by non-turn writes (titles, summaries), which made tabs drift.
+    metas.sort(key=lambda m: (m["last_ts"] or "", m["mtime"]), reverse=True)
     return metas[:limit]
 
 
