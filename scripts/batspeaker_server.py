@@ -379,15 +379,18 @@ function renderTurn(t){
   const card = document.createElement("div");
   card.className = "turn"; card.dataset.id = t.id;
   card._text = t.text || "";
+  // Speak + timestamp ride at the TOP of the card, where reading begins, so you
+  // don't scroll to the floor to start a turn. The player mounts directly under
+  // them (above the static body, which hides once the read-along takes over).
   card.innerHTML =
     (t.user ? `<div class="q">${escapeHtml(t.user)}</div>`:"") +
-    `<div class="body">${t.html||""}</div>` +
-    `<div class="player"></div>` +
     `<div class="row">
        <button class="speak">🔊 Speak</button>
        <span class="sub">${fmtTime(t.ts)}</span>
        <span class="grow"></span>
-     </div>`;
+     </div>` +
+    `<div class="player"></div>` +
+    `<div class="body">${t.html||""}</div>`;
   card.querySelector(".speak").onclick = () => mountPlayer(card);
   return card;
 }
