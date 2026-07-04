@@ -588,45 +588,77 @@ def _write_words(path, words):
         pass
 
 
+def _align_words(tokens, words):
+    """Map Unreal's tokens onto `words` (a whitespace split) by matching
+    ALPHANUMERIC characters, returning one {word,start,end} per word. Unreal
+    tokenizes on punctuation/hyphens (not just spaces) AND silently drops some
+    non-spoken punctuation (e.g. table pipes), so neither its token count nor its
+    exact characters equal a /\\s+/ split — but the alphanumeric content is the
+    same, so we walk the alnum streams together and give each word the span of the
+    tokens covering it. Pure-symbol words (no alnum) get a zero-width tick so the
+    per-word count stays exact. Returns None if the alnum streams diverge (e.g.
+    Unreal expanded a number) — the caller then falls back to the estimate."""
+    tchars = []                        # (alnum_char_lower, token_start, token_end)
+    for tk in tokens:
+        for ch in tk["word"]:
+            if ch.isalnum():
+                tchars.append((ch.lower(), tk["start"], tk["end"]))
+    out, ti, last_end = [], 0, 0.0
+    for word in words:
+        walnum = [c.lower() for c in word if c.isalnum()]
+        if not walnum:                 # pure punctuation/symbol word ("—", "|")
+            out.append({"word": word, "start": round(last_end, 3), "end": round(last_end, 3)})
+            continue
+        start = end = None
+        for c in walnum:
+            if ti >= len(tchars) or tchars[ti][0] != c:
+                return None            # alnum streams diverged
+            if start is None:
+                start = tchars[ti][1]
+            end = tchars[ti][2]
+            ti += 1
+        last_end = end
+        out.append({"word": word, "start": round(start, 3), "end": round(end, 3)})
+    if ti != len(tchars):
+        return None                    # leftover token alnum chars → mismatch
+    return out
+
+
 def synth_unreal(text, voice, out, words_out=None):
-    """Synthesize a turn to `out`. If words_out is given, also write the turn's
-    per-word timestamps there as a flat JSON list; multi-chunk turns get each
-    piece's times offset by the running audio duration so the whole-turn list is
-    continuous."""
-    # Unreal tokenizes its word timestamps on SPACES only — a newline-joined run
-    # ("a\nb\nc", common after markdown-stripping a list) becomes ONE token, while
-    # the client renders word-spans with /\s+/ (splits newlines too). Collapse all
-    # whitespace to single spaces so Unreal's tokens line up 1:1 with the spans and
-    # the highlight can use the real timestamps instead of the estimate. (Costs the
-    # paragraph-pause; sentence pauses on punctuation are unaffected.)
+    """Synthesize a turn to `out`. If words_out is given, also write per-word
+    timestamps aligned 1:1 to a whitespace split of the text (so the client's
+    word-spans map onto them exactly). Multi-chunk turns offset each piece by the
+    running audio duration; if any piece can't be aligned, no timestamps are
+    written and the whole turn falls back to the length estimate."""
+    # Collapse whitespace so the audio (and Unreal's tokens) come from spaced text
+    # — Unreal ignores newlines, and the client's /\s+/ split matches either way.
     text = re.sub(r"\s+", " ", text).strip()
     chunks = chunk_text(text, 3000)        # Unreal /speech per-call cap
     want = words_out is not None
-    if len(chunks) == 1:
-        words = _unreal_one(chunks[0], voice, out, want_words=want)
-        if want and words is not None:
-            _write_words(words_out, words)
-        return
-    parts, all_words, offset = [], [], 0.0
+    parts, all_words, offset, ok = [], [], 0.0, True
     for i, c in enumerate(chunks):
-        p = out.replace(".mp3", f".part{i}.mp3")
-        words = _unreal_one(c, voice, p, want_words=want)
+        p = out if len(chunks) == 1 else out.replace(".mp3", f".part{i}.mp3")
+        toks = _unreal_one(c, voice, p, want_words=want)
         parts.append(p)
-        if want and words:
-            for w in words:
-                all_words.append({"word": w["word"],
-                                  "start": round(w["start"] + offset, 3),
-                                  "end": round(w["end"] + offset, 3)})
         if want:
+            aligned = _align_words(toks, c.split()) if toks is not None else None
+            if aligned is None:
+                ok = False
+            else:
+                for w in aligned:
+                    all_words.append({"word": w["word"],
+                                      "start": round(w["start"] + offset, 3),
+                                      "end": round(w["end"] + offset, 3)})
             offset += _duration_f(p) or 0.0
-    concat_mp3s(parts, out)
+    if len(chunks) > 1:
+        concat_mp3s(parts, out)
+        for p in parts:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
     if want:
-        _write_words(words_out, all_words)
-    for p in parts:
-        try:
-            os.remove(p)
-        except Exception:
-            pass
+        _write_words(words_out, all_words if ok else [])
 
 
 def synth(text, cfg=None, out=None):
