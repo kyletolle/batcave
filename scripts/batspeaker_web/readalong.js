@@ -349,10 +349,14 @@ export class ReadAlong {
 
   // Await a chunk's result and fold its duration / real timings into the
   // timeline. Memoized in the source, so this shares gotoChunk's promise.
+  // Guard on JOB IDENTITY, not gen: gotoChunk bumps gen within the same speak(),
+  // so a gen check would wrongly treat this fill as superseded and drop the real
+  // timings (leaving the estimate). A new speak() swaps this.job, which is the
+  // real supersession signal.
   _pull(i) {
-    const myGen = this.gen;
+    const myJob = this.job;
     return this.source.synthChunk(i).then(res => {
-      if (this.gen !== myGen || !this.job) return res;
+      if (this.job !== myJob) return res;
       this.job.durations[i] = res.duration;
       if (res.wordTimings) this.job.chunks[i]._timings = res.wordTimings;
       this.el.scrub.max = this.totalKnown() || 0;

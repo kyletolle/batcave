@@ -635,7 +635,11 @@ class Handler(BaseHTTPRequestHandler):
             _, dur = core.synth_turn(turn_id, text)
         except Exception as ex:
             return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
-        return self._json(200, {"url": f"/audio/{turn_id}.mp3", "duration": dur})
+        resp = {"url": f"/audio/{turn_id}.mp3", "duration": dur}
+        words = core.load_words(turn_id)   # unreal per-word timestamps, if any
+        if words:
+            resp["words"] = words
+        return self._json(200, resp)
 
     # ---- SSE: new turns for one conversation ----
     def stream_events(self):

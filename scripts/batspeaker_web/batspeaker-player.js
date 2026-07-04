@@ -61,9 +61,17 @@ class BatSpeakerSource {
       if (!r.ok || d.error || !d.url) throw new Error(d.error || `HTTP ${r.status}`);
       const duration = d.duration || 0.2;
       job.durations[0] = duration;
-      this.slots[0].resolve({ audioUrl: d.url, wordTimings: null, duration });
+      // Real Unreal per-word timestamps → sample-accurate highlight, but only if
+      // they line up 1:1 with the rendered word-spans; otherwise let the player's
+      // length-weighted estimate take over.
+      const span = (job.chunks[0] && job.chunks[0].words) || [];
+      const api = d.words || [];
+      const timings = (api.length && api.length === span.length)
+        ? api.map(w => ({ start: w.start, end: w.end }))
+        : null;
+      this.slots[0].resolve({ audioUrl: d.url, wordTimings: timings, duration });
       this.ctx.status("");
-      this.ctx.log(`tts ok: ${duration}s`);
+      this.ctx.log(`tts ok: ${duration}s${timings ? `, ${timings.length} real word timings` : " (estimate)"}`);
     } catch (e) {
       if (this.job !== job) return;
       this.ctx.status("TTS failed");
@@ -88,6 +96,7 @@ window.mountReadAlong = function (root, opts) {
     // The player emits "done" from onended when the last chunk finishes — use
     // it to chain listen-mode without adding a hook to the shared player.
     onStatus: m => { if (m === "done" && opts.onDone) opts.onDone(); },
+    onLog: m => { try { console.log("[RA]", m); } catch (e) {} },
   });
   player.speak(opts.text || "");
   return player;

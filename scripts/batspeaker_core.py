@@ -530,14 +530,19 @@ def _unreal_endpoint(voice):
             else "https://api.v8.unrealspeech.com/speech")
 
 
-def _unreal_one(text, voice, out):
+def _unreal_one(text, voice, out, want_words=False):
+    """Synthesize one chunk to `out`. If want_words, also fetch Unreal's per-word
+    timestamps and return them as [{word,start,end}] (seconds); else return None."""
     import urllib.request
     key = get_env("UNREAL_SPEECH_API_KEY")
     if not key:
         raise RuntimeError("UNREAL_SPEECH_API_KEY not found")
+    payload = {"Text": text[:3000], "VoiceId": voice}
+    if want_words:
+        payload["TimestampType"] = "word"
     req = urllib.request.Request(
         _unreal_endpoint(voice),
-        data=json.dumps({"Text": text[:3000], "VoiceId": voice}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                  "User-Agent": _UNREAL_UA})
     with urllib.request.urlopen(req, timeout=120) as resp:
@@ -548,19 +553,75 @@ def _unreal_one(text, voice, out):
     audio_req = urllib.request.Request(uri, headers={"User-Agent": _UNREAL_UA})
     with urllib.request.urlopen(audio_req, timeout=120) as resp, open(out, "wb") as f:
         f.write(resp.read())
+    if not want_words:
+        return None
+    turi = meta.get("TimestampsUri")
+    if not turi:
+        return []
+    treq = urllib.request.Request(turi, headers={"User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(treq, timeout=120) as resp:
+        tj = json.loads(resp.read())
+    # Drop whitespace-only tokens so the count matches the client's word-spans
+    # (which filter empties via /\s+/ + Boolean).
+    return [{"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)}
+            for w in (tj or []) if (w.get("word") or "").strip()]
 
 
-def synth_unreal(text, voice, out):
+def _duration_f(path):
+    """Float duration in seconds (duration() rounds to int — too coarse to offset
+    per-chunk word timestamps when stitching a multi-chunk turn)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def _write_words(path, words):
+    try:
+        with open(path, "w") as f:
+            json.dump(words, f)
+    except Exception:
+        pass
+
+
+def synth_unreal(text, voice, out, words_out=None):
+    """Synthesize a turn to `out`. If words_out is given, also write the turn's
+    per-word timestamps there as a flat JSON list; multi-chunk turns get each
+    piece's times offset by the running audio duration so the whole-turn list is
+    continuous."""
+    # Unreal tokenizes its word timestamps on SPACES only — a newline-joined run
+    # ("a\nb\nc", common after markdown-stripping a list) becomes ONE token, while
+    # the client renders word-spans with /\s+/ (splits newlines too). Collapse all
+    # whitespace to single spaces so Unreal's tokens line up 1:1 with the spans and
+    # the highlight can use the real timestamps instead of the estimate. (Costs the
+    # paragraph-pause; sentence pauses on punctuation are unaffected.)
+    text = re.sub(r"\s+", " ", text).strip()
     chunks = chunk_text(text, 3000)        # Unreal /speech per-call cap
+    want = words_out is not None
     if len(chunks) == 1:
-        _unreal_one(chunks[0], voice, out)
+        words = _unreal_one(chunks[0], voice, out, want_words=want)
+        if want and words is not None:
+            _write_words(words_out, words)
         return
-    parts = []
+    parts, all_words, offset = [], [], 0.0
     for i, c in enumerate(chunks):
         p = out.replace(".mp3", f".part{i}.mp3")
-        _unreal_one(c, voice, p)
+        words = _unreal_one(c, voice, p, want_words=want)
         parts.append(p)
+        if want and words:
+            for w in words:
+                all_words.append({"word": w["word"],
+                                  "start": round(w["start"] + offset, 3),
+                                  "end": round(w["end"] + offset, 3)})
+        if want:
+            offset += _duration_f(p) or 0.0
     concat_mp3s(parts, out)
+    if want:
+        _write_words(words_out, all_words)
     for p in parts:
         try:
             os.remove(p)
@@ -592,7 +653,7 @@ def synth(text, cfg=None, out=None):
     elif engine == "elevenlabs":
         synth_elevenlabs(text, cfg["elevenlabs_voice"], cfg["elevenlabs_model"], out)
     elif engine == "unreal":
-        synth_unreal(text, cfg["unreal_voice"], out)
+        synth_unreal(text, cfg["unreal_voice"], out, words_out=out + ".words.json")
     else:
         raise RuntimeError(f"unknown engine: {engine}")
     # apply_speed retired: synth is 1x, the player owns speed. (function kept for
@@ -631,13 +692,32 @@ def audio_path_for(turn_id, cfg=None):
     return os.path.join(AUDIO_CACHE, f"{safe}.{_variant_tag(cfg)}.mp3")
 
 
+def words_path_for(turn_id, cfg=None):
+    """Sidecar path holding a turn's per-word timestamps (unreal only)."""
+    return audio_path_for(turn_id, cfg) + ".words.json"
+
+
+def load_words(turn_id, cfg=None):
+    """The turn's per-word timestamps [{word,start,end}] if present, else None."""
+    p = words_path_for(turn_id, cfg)
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
 def synth_turn(turn_id, text, cfg=None):
     """Synthesize (and cache) a turn's audio. Returns (audio_path, duration_s).
-    Reuses the cached mp3 if it already exists."""
+    Reuses the cached mp3 — but for unreal, a hit also requires the words sidecar,
+    so turns cached before word-timestamps existed re-synth once to gain them."""
     cfg = cfg or load_config()
     os.makedirs(AUDIO_CACHE, exist_ok=True)
     out = audio_path_for(turn_id, cfg)
-    if os.path.exists(out) and os.path.getsize(out) > 0:
+    words_ok = cfg.get("engine") != "unreal" or os.path.exists(out + ".words.json")
+    if os.path.exists(out) and os.path.getsize(out) > 0 and words_ok:
         return out, duration(out)
     synth(text, cfg, out)
     if not (os.path.exists(out) and os.path.getsize(out) > 0):
