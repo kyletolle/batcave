@@ -36,10 +36,16 @@ LISTEN_FILE = os.path.join(core.HOME, ".cache", "batspeaker", "listen.json")
 # Voice settings are the only editable config keys; everything else in
 # config.json (if present) is left untouched.
 EDITABLE = {"engine", "voice", "model", "deepgram_voice",
-            "elevenlabs_voice", "elevenlabs_model", "speed"}
-ENGINES = {"openai", "deepgram", "elevenlabs"}
+            "elevenlabs_voice", "elevenlabs_model", "unreal_voice", "speed"}
+ENGINES = {"openai", "deepgram", "elevenlabs", "unreal"}
 OPENAI_VOICES = ["alloy", "ash", "coral", "echo", "fable",
                  "nova", "onyx", "sage", "shimmer"]
+UNREAL_VOICES = core.UNREAL_VOICES   # v7 + v8 rosters, routed per-voice in core
+
+# Read-along player assets (shared ES modules copied from the reader; step 3 will
+# formalize these into one nullsix package). Resolved beside this script — stable
+# within the repo, unlike the vault-root __file__ idiom that broke at the cutover.
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batspeaker_web")
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -122,6 +128,9 @@ def turn_payload(turn, with_html=True):
     }
     if with_html:
         p["html"] = core.md_to_html(core.turn_full_md(turn))
+        # Spoken text (markdown stripped) drives the player's word-spans, so the
+        # read-along highlight tracks the exact word order the TTS speaks.
+        p["text"] = core.turn_spoken_text(turn)
     return p
 
 
@@ -246,7 +255,29 @@ PAGE = r"""<!DOCTYPE html>
            background:#2a2f3a; border:1px solid var(--line); padding:.5rem .8rem;
            border-radius:.5rem; opacity:0; transition:opacity .2s; pointer-events:none; }
   .toast.show { opacity:1; }
+
+  /* read-along player (shared ReadAlong module) */
+  .player { margin-top:.2rem; }
+  .ra-pane { font-size:1rem; line-height:1.9; }
+  .ra-pane .w { padding:0 1px; border-radius:3px; cursor:pointer; }
+  .ra-pane .w.cur { background:var(--acc); color:#14161a; }
+  .ra-controls { position:sticky; bottom:0; background:var(--panel);
+                 padding-top:.4rem; margin-top:.5rem; border-top:1px solid var(--line); }
+  .ra-controls .row { display:flex; align-items:center; gap:.4rem; margin:.4rem 0; flex-wrap:wrap; }
+  .ra-controls button { padding:.3rem .5rem; font-size:.85rem; }
+  .ra-controls button.icon { min-width:38px; font-variant-numeric:tabular-nums; }
+  .ra-controls button.round { width:40px; height:40px; border-radius:50%; font-size:1rem; padding:0; }
+  .ra-controls button.primary { background:var(--acc2); border-color:var(--acc2); color:#fff; }
+  .ra-controls .transport { justify-content:center; }
+  .ra-controls .scrub { width:100%; accent-color:var(--acc2); margin:.2rem 0; }
+  .ra-controls .time { color:var(--mut); font-size:.78rem; font-variant-numeric:tabular-nums; }
+  .ra-controls .status { color:var(--mut); font-size:.78rem; min-height:1.2em; }
+  .ra-controls .speeds { flex-wrap:nowrap; overflow-x:auto; gap:.3rem; }
+  .ra-controls .speeds button { flex:0 0 auto; padding:.25rem .5rem; font-size:.78rem; }
+  .ra-controls .speeds button.active { background:var(--acc2); border-color:var(--acc2); color:#fff; }
+  .ra-controls .spacer { flex:1; }
 </style>
+<script type="module" src="/web/batspeaker-player.js"></script>
 </head>
 <body>
 <header>
@@ -272,12 +303,13 @@ PAGE = r"""<!DOCTYPE html>
     <option value="openai">OpenAI</option>
     <option value="deepgram">Deepgram</option>
     <option value="elevenlabs">ElevenLabs</option>
+    <option value="unreal">Unreal Speech</option>
   </select>
   <label>OpenAI voice</label>
   <select id="cfgVoice"></select>
-  <label>Speed</label>
-  <input type="number" id="cfgSpeed" min="0.5" max="3" step="0.05">
-  <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize.</p>
+  <label>Unreal voice</label>
+  <select id="cfgUnrealVoice"></select>
+  <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize. Speed lives on each turn's player now (it remembers your last choice).</p>
 
   <div class="sect">Actions</div>
   <div class="row">
@@ -346,40 +378,32 @@ async function selectSession(id){
 function renderTurn(t){
   const card = document.createElement("div");
   card.className = "turn"; card.dataset.id = t.id;
+  card._text = t.text || "";
   card.innerHTML =
     (t.user ? `<div class="q">${escapeHtml(t.user)}</div>`:"") +
     `<div class="body">${t.html||""}</div>` +
+    `<div class="player"></div>` +
     `<div class="row">
        <button class="speak">🔊 Speak</button>
        <span class="sub">${fmtTime(t.ts)}</span>
        <span class="grow"></span>
      </div>`;
-  const row = card.querySelector(".row");
-  const speak = card.querySelector(".speak");
-  speak.onclick = () => requestTTS(t.id, card, speak);
-  if(t.audio_url){ attachAudio(card, t.audio_url); }
+  card.querySelector(".speak").onclick = () => mountPlayer(card);
   return card;
 }
 
-function attachAudio(card, url){
-  if(card.querySelector("audio")) return;
-  const a = document.createElement("audio");
-  a.controls = true; a.preload = "none"; a.src = url;
-  card.querySelector(".row").insertBefore(a, card.querySelector(".grow"));
+// Mount the shared ReadAlong player on a turn card (once) and start it. Hides
+// the static body + Speak button; the player's pane becomes the read-along view.
+function mountPlayer(card, {onDone=null}={}){
+  if(!active || card._player) return card._player;
+  const text = card._text || "";
+  if(text.trim().length < 2){ toast("nothing to speak"); return; }
+  if(!window.mountReadAlong){ toast("player still loading…"); return; }
+  const body = card.querySelector(".body"); if(body) body.style.display="none";
   const sp = card.querySelector(".speak"); if(sp) sp.style.display="none";
-  return a;
-}
-
-async function requestTTS(turnId, card, btn){
-  if(!active) return;
-  btn.classList.add("busy"); btn.textContent = "… synthesizing";
-  try{
-    const r = await fetch("/tts", {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({session:active, turn:turnId})});
-    const d = await r.json();
-    if(d.url){ const a = attachAudio(card, d.url); if(audioUnlocked && a){ a.play().catch(()=>{}); } }
-    else { toast(d.error||"TTS failed"); btn.classList.remove("busy"); btn.textContent="🔊 Speak"; }
-  }catch(e){ toast("TTS failed"); btn.classList.remove("busy"); btn.textContent="🔊 Speak"; }
+  card._player = window.mountReadAlong(card.querySelector(".player"),
+    {session:active, turnId:card.dataset.id, text, onDone});
+  return card._player;
 }
 
 function openStream(id){
@@ -389,10 +413,14 @@ function openStream(id){
     let t; try{ t = JSON.parse(ev.data); }catch{ return; }
     if(active!==id) return;
     if(seen.has(t.id)){
-      // turn grew: refresh its body/audio in place
+      // turn grew: refresh its text + body in place, but don't yank the pane
+      // out from under a card whose player already took over.
       const card = $(`.turn[data-id="${cssEsc(t.id)}"]`);
-      if(card){ card.querySelector(".body").innerHTML = t.html||"";
-        if(t.audio_url) attachAudio(card, t.audio_url); }
+      if(card){
+        card._text = t.text || card._text;
+        const body = card.querySelector(".body");
+        if(body && !card._player) body.innerHTML = t.html||"";
+      }
       return;
     }
     seen.add(t.id);
@@ -401,22 +429,21 @@ function openStream(id){
     const atBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
     thread.appendChild(card);
     if(atBottom) thread.scrollTop = thread.scrollHeight;
-    if(t.audio_url){ enqueue(t.audio_url, card); }
+    if(t.audio_url){ enqueue(card); }   // listen mode: server pre-synthed it
   };
   es.onerror = () => { $("#liveDot").style.color="#888"; };
   es.onopen = () => { $("#liveDot").style.color="var(--acc)"; };
 }
 
-function enqueue(url, card){
+function enqueue(card){
   if(!audioUnlocked) return;          // listen mode but audio not unlocked yet
-  queue.push({url, card}); pump();
+  queue.push(card); pump();
 }
 function pump(){
   if(playing || !queue.length) return;
-  const {url, card} = queue.shift(); playing = true;
-  const a = card.querySelector("audio") || attachAudio(card, url);
-  a.onended = () => { playing=false; pump(); };
-  a.play().catch(()=>{ playing=false; pump(); });
+  const card = queue.shift(); playing = true;
+  // Mount + play this turn; chain to the next when its player reports "done".
+  mountPlayer(card, {onDone:()=>{ playing=false; pump(); }});
 }
 
 // ---- iOS autoplay unlock ----
@@ -443,15 +470,17 @@ async function loadConfig(){
   const vsel = $("#cfgVoice"); vsel.innerHTML="";
   (c.voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
     if(v===c.voice) o.selected=true; vsel.appendChild(o); });
+  const usel = $("#cfgUnrealVoice"); usel.innerHTML="";
+  (c.unreal_voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
+    if(v===c.unreal_voice) o.selected=true; usel.appendChild(o); });
   $("#cfgEngine").value = c.engine||"openai";
-  $("#cfgSpeed").value = c.speed||"1.0";
 }
 $("#menuBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
 $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
 $("#cfgSave").onclick = async ()=>{
   await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
     body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
-                          speed:$("#cfgSpeed").value})});
+                          unreal_voice:$("#cfgUnrealVoice").value})});
   toast("Saved"); $("#panel").classList.remove("open");
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
@@ -530,7 +559,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/config":
             cfg = core.load_config()
             return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),
-                                    "speed": cfg.get("speed"), "voices": OPENAI_VOICES})
+                                    "speed": cfg.get("speed"), "voices": OPENAI_VOICES,
+                                    "unreal_voice": cfg.get("unreal_voice"),
+                                    "unreal_voices": UNREAL_VOICES})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})
@@ -538,7 +569,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.stream_events()
         if path.startswith("/audio/"):
             return self.serve_audio(path[len("/audio/"):])
+        if path.startswith("/web/"):
+            return self.serve_web(path[len("/web/"):])
         return self._send(404, "not found", ctype="text/plain")
+
+    def serve_web(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+\.js", name or ""):
+            return self._send(404, "not found", ctype="text/plain")
+        fp = os.path.abspath(os.path.join(WEB_DIR, name))
+        if not (fp.startswith(WEB_DIR + os.sep) and os.path.isfile(fp)):
+            return self._send(404, "not found", ctype="text/plain")
+        with open(fp, "rb") as f:
+            data = f.read()
+        return self._send(200, data, ctype="application/javascript; charset=utf-8",
+                          extra={"Cache-Control": "no-cache"})
 
     # ---- POST ----
     def do_POST(self):
@@ -591,7 +635,11 @@ class Handler(BaseHTTPRequestHandler):
             _, dur = core.synth_turn(turn_id, text)
         except Exception as ex:
             return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
-        return self._json(200, {"url": f"/audio/{turn_id}.mp3", "duration": dur})
+        resp = {"url": f"/audio/{turn_id}.mp3", "duration": dur}
+        words = core.load_words(turn_id)   # unreal per-word timestamps, if any
+        if words:
+            resp["words"] = words
+        return self._json(200, resp)
 
     # ---- SSE: new turns for one conversation ----
     def stream_events(self):

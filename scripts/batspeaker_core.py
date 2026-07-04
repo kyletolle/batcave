@@ -24,12 +24,13 @@ AUDIO_CACHE = os.path.join(HOME, ".cache", "batspeaker", "audio")
 TTS = os.path.join(HOME, ".local", "bin", "tts")
 
 DEFAULTS = {
-    "engine": "openai",    # openai | deepgram | elevenlabs
+    "engine": "openai",    # openai | deepgram | elevenlabs | unreal
     "voice": "ash",        # OpenAI voice
     "model": "tts-1-hd",   # OpenAI model
     "deepgram_voice": "orpheus",
     "elevenlabs_voice": "nPczCjzI2devNBz1zQrb",
     "elevenlabs_model": "eleven_multilingual_v2",
+    "unreal_voice": "Scarlett",   # Unreal Speech: Scarlett|Dan|Liv|Will|Amy
     "speed": "1.0",
 }
 
@@ -506,8 +507,164 @@ def synth_elevenlabs(text, voice_id, model_id, out):
         f.write(resp.read())
 
 
+# Unreal sits behind Cloudflare, which bans urllib's default UA (error 1010).
+# A normal User-Agent is required on every hop, including the OutputUri fetch.
+_UNREAL_UA = "Mozilla/5.0 (X11; Linux x86_64) batspeaker/1.0"
+
+# v7 and v8 have DISJOINT voice rosters, so each voice routes to its own endpoint.
+UNREAL_V7_VOICES = ["Scarlett", "Dan", "Liv", "Will", "Amy"]
+# All v8 MALE voices, grouped by accent (Bruce is male-coded). Female v8 voices
+# omitted by intent; add from the full roster if ever wanted.
+UNREAL_V8_VOICES = [
+    "Ethan", "Daniel", "Noah", "Zane", "Rowan", "Jasper", "Caleb", "Ronan",  # American
+    "Arthur", "Edward", "Oliver", "Benjamin",                                  # British
+    "Mateo", "Javier", "Luca", "Thiago", "Rafael",                            # Spanish/Italian/Portuguese
+    "Arjun", "Rohan", "Haruto", "Wei", "Jian", "Hao", "Sheng",               # Hindi/Japanese/Chinese
+]
+UNREAL_VOICES = UNREAL_V7_VOICES + UNREAL_V8_VOICES       # panel order
+_UNREAL_V7 = set(UNREAL_V7_VOICES)
+
+
+def _unreal_endpoint(voice):
+    return ("https://api.v7.unrealspeech.com/speech" if voice in _UNREAL_V7
+            else "https://api.v8.unrealspeech.com/speech")
+
+
+def _unreal_one(text, voice, out, want_words=False):
+    """Synthesize one chunk to `out`. If want_words, also fetch Unreal's per-word
+    timestamps and return them as [{word,start,end}] (seconds); else return None."""
+    import urllib.request
+    key = get_env("UNREAL_SPEECH_API_KEY")
+    if not key:
+        raise RuntimeError("UNREAL_SPEECH_API_KEY not found")
+    payload = {"Text": text[:3000], "VoiceId": voice}
+    if want_words:
+        payload["TimestampType"] = "word"
+    req = urllib.request.Request(
+        _unreal_endpoint(voice),
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        meta = json.loads(resp.read())
+    uri = meta.get("OutputUri")
+    if not uri:
+        raise RuntimeError(f"unreal: no OutputUri ({str(meta)[:150]})")
+    audio_req = urllib.request.Request(uri, headers={"User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(audio_req, timeout=120) as resp, open(out, "wb") as f:
+        f.write(resp.read())
+    if not want_words:
+        return None
+    turi = meta.get("TimestampsUri")
+    if not turi:
+        return []
+    treq = urllib.request.Request(turi, headers={"User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(treq, timeout=120) as resp:
+        tj = json.loads(resp.read())
+    # Drop whitespace-only tokens so the count matches the client's word-spans
+    # (which filter empties via /\s+/ + Boolean).
+    return [{"word": w.get("word", ""), "start": w.get("start", 0.0), "end": w.get("end", 0.0)}
+            for w in (tj or []) if (w.get("word") or "").strip()]
+
+
+def _duration_f(path):
+    """Float duration in seconds (duration() rounds to int — too coarse to offset
+    per-chunk word timestamps when stitching a multi-chunk turn)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=10)
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def _write_words(path, words):
+    try:
+        with open(path, "w") as f:
+            json.dump(words, f)
+    except Exception:
+        pass
+
+
+def _align_words(tokens, words):
+    """Map Unreal's tokens onto `words` (a whitespace split) by matching
+    ALPHANUMERIC characters, returning one {word,start,end} per word. Unreal
+    tokenizes on punctuation/hyphens (not just spaces) AND silently drops some
+    non-spoken punctuation (e.g. table pipes), so neither its token count nor its
+    exact characters equal a /\\s+/ split — but the alphanumeric content is the
+    same, so we walk the alnum streams together and give each word the span of the
+    tokens covering it. Pure-symbol words (no alnum) get a zero-width tick so the
+    per-word count stays exact. Returns None if the alnum streams diverge (e.g.
+    Unreal expanded a number) — the caller then falls back to the estimate."""
+    tchars = []                        # (alnum_char_lower, token_start, token_end)
+    for tk in tokens:
+        for ch in tk["word"]:
+            if ch.isalnum():
+                tchars.append((ch.lower(), tk["start"], tk["end"]))
+    out, ti, last_end = [], 0, 0.0
+    for word in words:
+        walnum = [c.lower() for c in word if c.isalnum()]
+        if not walnum:                 # pure punctuation/symbol word ("—", "|")
+            out.append({"word": word, "start": round(last_end, 3), "end": round(last_end, 3)})
+            continue
+        start = end = None
+        for c in walnum:
+            if ti >= len(tchars) or tchars[ti][0] != c:
+                return None            # alnum streams diverged
+            if start is None:
+                start = tchars[ti][1]
+            end = tchars[ti][2]
+            ti += 1
+        last_end = end
+        out.append({"word": word, "start": round(start, 3), "end": round(end, 3)})
+    if ti != len(tchars):
+        return None                    # leftover token alnum chars → mismatch
+    return out
+
+
+def synth_unreal(text, voice, out, words_out=None):
+    """Synthesize a turn to `out`. If words_out is given, also write per-word
+    timestamps aligned 1:1 to a whitespace split of the text (so the client's
+    word-spans map onto them exactly). Multi-chunk turns offset each piece by the
+    running audio duration; if any piece can't be aligned, no timestamps are
+    written and the whole turn falls back to the length estimate."""
+    # Collapse whitespace so the audio (and Unreal's tokens) come from spaced text
+    # — Unreal ignores newlines, and the client's /\s+/ split matches either way.
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks = chunk_text(text, 3000)        # Unreal /speech per-call cap
+    want = words_out is not None
+    parts, all_words, offset, ok = [], [], 0.0, True
+    for i, c in enumerate(chunks):
+        p = out if len(chunks) == 1 else out.replace(".mp3", f".part{i}.mp3")
+        toks = _unreal_one(c, voice, p, want_words=want)
+        parts.append(p)
+        if want:
+            aligned = _align_words(toks, c.split()) if toks is not None else None
+            if aligned is None:
+                ok = False
+            else:
+                for w in aligned:
+                    all_words.append({"word": w["word"],
+                                      "start": round(w["start"] + offset, 3),
+                                      "end": round(w["end"] + offset, 3)})
+            offset += _duration_f(p) or 0.0
+    if len(chunks) > 1:
+        concat_mp3s(parts, out)
+        for p in parts:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    if want:
+        _write_words(words_out, all_words if ok else [])
+
+
 def synth(text, cfg=None, out=None):
-    """Render `text` to mp3 `out` via the configured engine. Raises on failure."""
+    """Render `text` to mp3 `out` via the configured engine, always at 1x.
+    Playback speed is applied client-side (pitch-preserved playbackRate) by the
+    read-along player, so one cached mp3 serves every speed. Raises on failure."""
     cfg = cfg or load_config()
     engine = cfg.get("engine", "openai")
     if engine == "openai":
@@ -518,7 +675,7 @@ def synth(text, cfg=None, out=None):
             raise RuntimeError("OPENAI_API_KEY not found")
         env = {**os.environ, "OPENAI_API_KEY": key}
         r = subprocess.run([TTS, "-v", cfg["voice"], "-m", cfg["model"],
-                            "-s", str(cfg["speed"]), "-o", out],
+                            "-s", "1.0", "-o", out],
                            input=text, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"tts rc={r.returncode}: {r.stderr.strip()[:200]}")
@@ -527,9 +684,12 @@ def synth(text, cfg=None, out=None):
         synth_deepgram(text, cfg["deepgram_voice"], out)
     elif engine == "elevenlabs":
         synth_elevenlabs(text, cfg["elevenlabs_voice"], cfg["elevenlabs_model"], out)
+    elif engine == "unreal":
+        synth_unreal(text, cfg["unreal_voice"], out, words_out=out + ".words.json")
     else:
         raise RuntimeError(f"unknown engine: {engine}")
-    apply_speed(out, str(cfg.get("speed", "1.0")))
+    # apply_speed retired: synth is 1x, the player owns speed. (function kept for
+    # now in case a non-player caller ever wants a baked-speed render.)
 
 
 def duration(path):
@@ -543,17 +703,53 @@ def duration(path):
         return None
 
 
-def audio_path_for(turn_id):
+def _variant_tag(cfg):
+    """Engine+voice discriminator so different renderings of the same turn cache
+    to different files (otherwise switching engine/voice served stale audio).
+    Speed is NOT part of the tag anymore: synth is 1x and the player applies
+    speed client-side, so one cached mp3 serves every speed."""
+    engine = cfg.get("engine", "openai")
+    voice = {
+        "openai": cfg.get("voice"),
+        "deepgram": cfg.get("deepgram_voice"),
+        "elevenlabs": cfg.get("elevenlabs_voice"),
+        "unreal": cfg.get("unreal_voice"),
+    }.get(engine) or ""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", f"{engine}-{voice}")
+
+
+def audio_path_for(turn_id, cfg=None):
+    cfg = cfg or load_config()
     safe = re.sub(r"[^A-Za-z0-9_-]", "", turn_id)[:120] or "turn"
-    return os.path.join(AUDIO_CACHE, safe + ".mp3")
+    return os.path.join(AUDIO_CACHE, f"{safe}.{_variant_tag(cfg)}.mp3")
+
+
+def words_path_for(turn_id, cfg=None):
+    """Sidecar path holding a turn's per-word timestamps (unreal only)."""
+    return audio_path_for(turn_id, cfg) + ".words.json"
+
+
+def load_words(turn_id, cfg=None):
+    """The turn's per-word timestamps [{word,start,end}] if present, else None."""
+    p = words_path_for(turn_id, cfg)
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 def synth_turn(turn_id, text, cfg=None):
     """Synthesize (and cache) a turn's audio. Returns (audio_path, duration_s).
-    Reuses the cached mp3 if it already exists."""
+    Reuses the cached mp3 — but for unreal, a hit also requires the words sidecar,
+    so turns cached before word-timestamps existed re-synth once to gain them."""
+    cfg = cfg or load_config()
     os.makedirs(AUDIO_CACHE, exist_ok=True)
-    out = audio_path_for(turn_id)
-    if os.path.exists(out) and os.path.getsize(out) > 0:
+    out = audio_path_for(turn_id, cfg)
+    words_ok = cfg.get("engine") != "unreal" or os.path.exists(out + ".words.json")
+    if os.path.exists(out) and os.path.getsize(out) > 0 and words_ok:
         return out, duration(out)
     synth(text, cfg, out)
     if not (os.path.exists(out) and os.path.getsize(out) > 0):
