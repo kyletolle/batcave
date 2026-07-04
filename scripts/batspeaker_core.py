@@ -569,7 +569,9 @@ def synth_unreal(text, voice, out):
 
 
 def synth(text, cfg=None, out=None):
-    """Render `text` to mp3 `out` via the configured engine. Raises on failure."""
+    """Render `text` to mp3 `out` via the configured engine, always at 1x.
+    Playback speed is applied client-side (pitch-preserved playbackRate) by the
+    read-along player, so one cached mp3 serves every speed. Raises on failure."""
     cfg = cfg or load_config()
     engine = cfg.get("engine", "openai")
     if engine == "openai":
@@ -580,7 +582,7 @@ def synth(text, cfg=None, out=None):
             raise RuntimeError("OPENAI_API_KEY not found")
         env = {**os.environ, "OPENAI_API_KEY": key}
         r = subprocess.run([TTS, "-v", cfg["voice"], "-m", cfg["model"],
-                            "-s", str(cfg["speed"]), "-o", out],
+                            "-s", "1.0", "-o", out],
                            input=text, capture_output=True, text=True, env=env)
         if r.returncode != 0:
             raise RuntimeError(f"tts rc={r.returncode}: {r.stderr.strip()[:200]}")
@@ -593,7 +595,8 @@ def synth(text, cfg=None, out=None):
         synth_unreal(text, cfg["unreal_voice"], out)
     else:
         raise RuntimeError(f"unknown engine: {engine}")
-    apply_speed(out, str(cfg.get("speed", "1.0")))
+    # apply_speed retired: synth is 1x, the player owns speed. (function kept for
+    # now in case a non-player caller ever wants a baked-speed render.)
 
 
 def duration(path):
@@ -608,8 +611,10 @@ def duration(path):
 
 
 def _variant_tag(cfg):
-    """Engine+voice+speed discriminator so different renderings of the same turn
-    cache to different files (otherwise switching engine/voice served stale audio)."""
+    """Engine+voice discriminator so different renderings of the same turn cache
+    to different files (otherwise switching engine/voice served stale audio).
+    Speed is NOT part of the tag anymore: synth is 1x and the player applies
+    speed client-side, so one cached mp3 serves every speed."""
     engine = cfg.get("engine", "openai")
     voice = {
         "openai": cfg.get("voice"),
@@ -617,7 +622,7 @@ def _variant_tag(cfg):
         "elevenlabs": cfg.get("elevenlabs_voice"),
         "unreal": cfg.get("unreal_voice"),
     }.get(engine) or ""
-    return re.sub(r"[^A-Za-z0-9_.-]", "", f"{engine}-{voice}-s{cfg.get('speed', '1.0')}")
+    return re.sub(r"[^A-Za-z0-9_.-]", "", f"{engine}-{voice}")
 
 
 def audio_path_for(turn_id, cfg=None):
