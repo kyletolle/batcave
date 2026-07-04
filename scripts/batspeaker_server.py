@@ -36,10 +36,11 @@ LISTEN_FILE = os.path.join(core.HOME, ".cache", "batspeaker", "listen.json")
 # Voice settings are the only editable config keys; everything else in
 # config.json (if present) is left untouched.
 EDITABLE = {"engine", "voice", "model", "deepgram_voice",
-            "elevenlabs_voice", "elevenlabs_model", "speed"}
-ENGINES = {"openai", "deepgram", "elevenlabs"}
+            "elevenlabs_voice", "elevenlabs_model", "unreal_voice", "speed"}
+ENGINES = {"openai", "deepgram", "elevenlabs", "unreal"}
 OPENAI_VOICES = ["alloy", "ash", "coral", "echo", "fable",
                  "nova", "onyx", "sage", "shimmer"]
+UNREAL_VOICES = core.UNREAL_VOICES   # v7 + v8 rosters, routed per-voice in core
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -272,9 +273,12 @@ PAGE = r"""<!DOCTYPE html>
     <option value="openai">OpenAI</option>
     <option value="deepgram">Deepgram</option>
     <option value="elevenlabs">ElevenLabs</option>
+    <option value="unreal">Unreal Speech</option>
   </select>
   <label>OpenAI voice</label>
   <select id="cfgVoice"></select>
+  <label>Unreal voice</label>
+  <select id="cfgUnrealVoice"></select>
   <label>Speed</label>
   <input type="number" id="cfgSpeed" min="0.5" max="3" step="0.05">
   <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize.</p>
@@ -443,6 +447,9 @@ async function loadConfig(){
   const vsel = $("#cfgVoice"); vsel.innerHTML="";
   (c.voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
     if(v===c.voice) o.selected=true; vsel.appendChild(o); });
+  const usel = $("#cfgUnrealVoice"); usel.innerHTML="";
+  (c.unreal_voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
+    if(v===c.unreal_voice) o.selected=true; usel.appendChild(o); });
   $("#cfgEngine").value = c.engine||"openai";
   $("#cfgSpeed").value = c.speed||"1.0";
 }
@@ -451,7 +458,7 @@ $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
 $("#cfgSave").onclick = async ()=>{
   await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
     body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
-                          speed:$("#cfgSpeed").value})});
+                          unreal_voice:$("#cfgUnrealVoice").value, speed:$("#cfgSpeed").value})});
   toast("Saved"); $("#panel").classList.remove("open");
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
@@ -530,7 +537,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/config":
             cfg = core.load_config()
             return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),
-                                    "speed": cfg.get("speed"), "voices": OPENAI_VOICES})
+                                    "speed": cfg.get("speed"), "voices": OPENAI_VOICES,
+                                    "unreal_voice": cfg.get("unreal_voice"),
+                                    "unreal_voices": UNREAL_VOICES})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})

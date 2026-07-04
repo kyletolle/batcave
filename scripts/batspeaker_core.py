@@ -24,12 +24,13 @@ AUDIO_CACHE = os.path.join(HOME, ".cache", "batspeaker", "audio")
 TTS = os.path.join(HOME, ".local", "bin", "tts")
 
 DEFAULTS = {
-    "engine": "openai",    # openai | deepgram | elevenlabs
+    "engine": "openai",    # openai | deepgram | elevenlabs | unreal
     "voice": "ash",        # OpenAI voice
     "model": "tts-1-hd",   # OpenAI model
     "deepgram_voice": "orpheus",
     "elevenlabs_voice": "nPczCjzI2devNBz1zQrb",
     "elevenlabs_model": "eleven_multilingual_v2",
+    "unreal_voice": "Scarlett",   # Unreal Speech: Scarlett|Dan|Liv|Will|Amy
     "speed": "1.0",
 }
 
@@ -506,6 +507,67 @@ def synth_elevenlabs(text, voice_id, model_id, out):
         f.write(resp.read())
 
 
+# Unreal sits behind Cloudflare, which bans urllib's default UA (error 1010).
+# A normal User-Agent is required on every hop, including the OutputUri fetch.
+_UNREAL_UA = "Mozilla/5.0 (X11; Linux x86_64) batspeaker/1.0"
+
+# v7 and v8 have DISJOINT voice rosters, so each voice routes to its own endpoint.
+UNREAL_V7_VOICES = ["Scarlett", "Dan", "Liv", "Will", "Amy"]
+# All v8 MALE voices, grouped by accent (Bruce is male-coded). Female v8 voices
+# omitted by intent; add from the full roster if ever wanted.
+UNREAL_V8_VOICES = [
+    "Ethan", "Daniel", "Noah", "Zane", "Rowan", "Jasper", "Caleb", "Ronan",  # American
+    "Arthur", "Edward", "Oliver", "Benjamin",                                  # British
+    "Mateo", "Javier", "Luca", "Thiago", "Rafael",                            # Spanish/Italian/Portuguese
+    "Arjun", "Rohan", "Haruto", "Wei", "Jian", "Hao", "Sheng",               # Hindi/Japanese/Chinese
+]
+UNREAL_VOICES = UNREAL_V7_VOICES + UNREAL_V8_VOICES       # panel order
+_UNREAL_V7 = set(UNREAL_V7_VOICES)
+
+
+def _unreal_endpoint(voice):
+    return ("https://api.v7.unrealspeech.com/speech" if voice in _UNREAL_V7
+            else "https://api.v8.unrealspeech.com/speech")
+
+
+def _unreal_one(text, voice, out):
+    import urllib.request
+    key = get_env("UNREAL_SPEECH_API_KEY")
+    if not key:
+        raise RuntimeError("UNREAL_SPEECH_API_KEY not found")
+    req = urllib.request.Request(
+        _unreal_endpoint(voice),
+        data=json.dumps({"Text": text[:3000], "VoiceId": voice}).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        meta = json.loads(resp.read())
+    uri = meta.get("OutputUri")
+    if not uri:
+        raise RuntimeError(f"unreal: no OutputUri ({str(meta)[:150]})")
+    audio_req = urllib.request.Request(uri, headers={"User-Agent": _UNREAL_UA})
+    with urllib.request.urlopen(audio_req, timeout=120) as resp, open(out, "wb") as f:
+        f.write(resp.read())
+
+
+def synth_unreal(text, voice, out):
+    chunks = chunk_text(text, 3000)        # Unreal /speech per-call cap
+    if len(chunks) == 1:
+        _unreal_one(chunks[0], voice, out)
+        return
+    parts = []
+    for i, c in enumerate(chunks):
+        p = out.replace(".mp3", f".part{i}.mp3")
+        _unreal_one(c, voice, p)
+        parts.append(p)
+    concat_mp3s(parts, out)
+    for p in parts:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+
 def synth(text, cfg=None, out=None):
     """Render `text` to mp3 `out` via the configured engine. Raises on failure."""
     cfg = cfg or load_config()
@@ -527,6 +589,8 @@ def synth(text, cfg=None, out=None):
         synth_deepgram(text, cfg["deepgram_voice"], out)
     elif engine == "elevenlabs":
         synth_elevenlabs(text, cfg["elevenlabs_voice"], cfg["elevenlabs_model"], out)
+    elif engine == "unreal":
+        synth_unreal(text, cfg["unreal_voice"], out)
     else:
         raise RuntimeError(f"unknown engine: {engine}")
     apply_speed(out, str(cfg.get("speed", "1.0")))
@@ -543,16 +607,31 @@ def duration(path):
         return None
 
 
-def audio_path_for(turn_id):
+def _variant_tag(cfg):
+    """Engine+voice+speed discriminator so different renderings of the same turn
+    cache to different files (otherwise switching engine/voice served stale audio)."""
+    engine = cfg.get("engine", "openai")
+    voice = {
+        "openai": cfg.get("voice"),
+        "deepgram": cfg.get("deepgram_voice"),
+        "elevenlabs": cfg.get("elevenlabs_voice"),
+        "unreal": cfg.get("unreal_voice"),
+    }.get(engine) or ""
+    return re.sub(r"[^A-Za-z0-9_.-]", "", f"{engine}-{voice}-s{cfg.get('speed', '1.0')}")
+
+
+def audio_path_for(turn_id, cfg=None):
+    cfg = cfg or load_config()
     safe = re.sub(r"[^A-Za-z0-9_-]", "", turn_id)[:120] or "turn"
-    return os.path.join(AUDIO_CACHE, safe + ".mp3")
+    return os.path.join(AUDIO_CACHE, f"{safe}.{_variant_tag(cfg)}.mp3")
 
 
 def synth_turn(turn_id, text, cfg=None):
     """Synthesize (and cache) a turn's audio. Returns (audio_path, duration_s).
     Reuses the cached mp3 if it already exists."""
+    cfg = cfg or load_config()
     os.makedirs(AUDIO_CACHE, exist_ok=True)
-    out = audio_path_for(turn_id)
+    out = audio_path_for(turn_id, cfg)
     if os.path.exists(out) and os.path.getsize(out) > 0:
         return out, duration(out)
     synth(text, cfg, out)
