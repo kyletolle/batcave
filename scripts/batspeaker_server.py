@@ -277,6 +277,14 @@ PAGE = r"""<!DOCTYPE html>
   .ra-controls .time { color:var(--mut); font-size:.78rem; font-variant-numeric:tabular-nums; }
   .ra-controls .status { color:var(--mut); font-size:.78rem; min-height:1.2em; }
   .ra-controls .speeds { flex-wrap:nowrap; overflow-x:auto; gap:.3rem; }
+  /* compact transport: one control line + prev/next speed stepper */
+  .ra-controls.compact .compact-bar { justify-content:flex-start; flex-wrap:wrap; gap:.3rem; }
+  .ra-controls.compact button.round { width:36px; height:36px; }
+  .ra-controls.compact .time { margin-left:auto; }   /* push time + stop to the right edge */
+  .spd-stepper { display:inline-flex; align-items:center; gap:.15rem; margin-left:.15rem; }
+  .spd-stepper .spd-val { min-width:3.1em; text-align:center; color:var(--fg);
+                          font-size:.85rem; font-variant-numeric:tabular-nums; }
+  .ra-controls button:disabled { opacity:.35; }
   .ra-controls .speeds button { flex:0 0 auto; padding:.25rem .5rem; font-size:.78rem; }
   .ra-controls .speeds button.active { background:var(--acc2); border-color:var(--acc2); color:#fff; }
   .ra-controls .spacer { flex:1; }

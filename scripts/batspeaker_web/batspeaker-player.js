@@ -91,6 +91,7 @@ window.mountReadAlong = function (root, opts) {
   const player = new ReadAlong(root, source, {
     prepare: t => prepareOne(t),
     getMd: () => false,
+    compact: true,          // phone-first: one control line + speed stepper
     speedKey: "batspeaker.speed",
     defaultSpeed: 1.5,
     // The player emits "done" from onended when the last chunk finishes — use
