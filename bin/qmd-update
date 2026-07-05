@@ -24,9 +24,14 @@ update_output=$(qmd update 2>&1)
 update_rc=$?
 update_ms=$(( ($(date +%s%N) - update_start) / 1000000 ))
 
-# Run embed
+# Run embed.
+# --max-docs-per-batch 8: qmd's embed session has a hardcoded 30-min cap. On
+# faramir's 2 CPU cores, a default 64-doc batch of large notes can't finish
+# inside that window, so the session expires mid-batch and removeIncompleteEmbeddings
+# wipes the whole partial batch → "embedded 0 chunks" and the backlog never drains
+# (2026-07-05 stuck re-embed post-mortem). Small batches commit before the cap.
 embed_start=$(date +%s%N)
-embed_output=$(qmd embed 2>&1)
+embed_output=$(qmd embed --max-docs-per-batch 8 2>&1)
 embed_rc=$?
 embed_ms=$(( ($(date +%s%N) - embed_start) / 1000000 ))
 
