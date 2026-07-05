@@ -233,6 +233,10 @@ PAGE = r"""<!DOCTYPE html>
                            margin:.5rem 0; padding-left:.7rem; }
   .turn .body h1,.turn .body h2,.turn .body h3 { font-size:1.05rem; margin:.7rem 0 .35rem; }
   .row { display:flex; align-items:center; gap:.6rem; margin-top:.6rem; }
+  /* The card's own control row sticks to the bottom of the screen so Speak is
+     always reachable while scrolling a long turn (matches the sticky transport). */
+  .turn > .row { position:sticky; bottom:0; z-index:2; background:var(--panel);
+                 border-top:1px solid var(--line); padding:.5rem 0 .2rem; margin-top:.5rem; }
   .row audio { flex:1; height:34px; }
   .speak { font-size:.85rem; }
   .speak.busy { opacity:.5; }
@@ -379,18 +383,20 @@ function renderTurn(t){
   const card = document.createElement("div");
   card.className = "turn"; card.dataset.id = t.id;
   card._text = t.text || "";
-  // Speak + timestamp ride at the TOP of the card, where reading begins, so you
-  // don't scroll to the floor to start a turn. The player mounts directly under
-  // them (above the static body, which hides once the read-along takes over).
+  // Speak + timestamp sit at the card bottom but STICK to the bottom of the
+  // screen (.turn > .row is position:sticky) so Speak is always in view no matter
+  // where you are in a long turn — no scroll-hunting for it. This mirrors the
+  // read-along transport, itself sticky-bottom, so the control zone stays pinned
+  // to the same place whether a turn is playing (transport) or idle (Speak).
   card.innerHTML =
     (t.user ? `<div class="q">${escapeHtml(t.user)}</div>`:"") +
+    `<div class="player"></div>` +
+    `<div class="body">${t.html||""}</div>` +
     `<div class="row">
        <button class="speak">🔊 Speak</button>
        <span class="sub">${fmtTime(t.ts)}</span>
        <span class="grow"></span>
-     </div>` +
-    `<div class="player"></div>` +
-    `<div class="body">${t.html||""}</div>`;
+     </div>`;
   card.querySelector(".speak").onclick = () => mountPlayer(card);
   return card;
 }
@@ -403,7 +409,10 @@ function mountPlayer(card, {onDone=null}={}){
   if(text.trim().length < 2){ toast("nothing to speak"); return; }
   if(!window.mountReadAlong){ toast("player still loading…"); return; }
   const body = card.querySelector(".body"); if(body) body.style.display="none";
-  const sp = card.querySelector(".speak"); if(sp) sp.style.display="none";
+  // Hide the whole idle row (Speak + timestamp), not just the button: the player's
+  // own transport is sticky-bottom too, so leaving the row visible would stack two
+  // sticky bars at the screen bottom.
+  const row = card.querySelector(":scope > .row"); if(row) row.style.display="none";
   card._player = window.mountReadAlong(card.querySelector(".player"),
     {session:active, turnId:card.dataset.id, text, onDone});
   return card._player;
