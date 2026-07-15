@@ -36,11 +36,14 @@ LISTEN_FILE = os.path.join(core.HOME, ".cache", "batspeaker", "listen.json")
 # Voice settings are the only editable config keys; everything else in
 # config.json (if present) is left untouched.
 EDITABLE = {"engine", "voice", "model", "deepgram_voice",
-            "elevenlabs_voice", "elevenlabs_model", "unreal_voice", "speed"}
-ENGINES = {"openai", "deepgram", "elevenlabs", "unreal"}
+            "elevenlabs_voice", "elevenlabs_model", "unreal_voice",
+            "inworld_voice", "kokoro_voice", "speed"}
+ENGINES = {"inworld", "kokoro-deepinfra", "openai", "deepgram", "elevenlabs", "unreal"}
 OPENAI_VOICES = ["alloy", "ash", "coral", "echo", "fable",
                  "nova", "onyx", "sage", "shimmer"]
 UNREAL_VOICES = core.UNREAL_VOICES   # v7 + v8 rosters, routed per-voice in core
+INWORLD_VOICES = core.INWORLD_VOICES
+KOKORO_VOICES = core.KOKORO_VOICES
 
 # Read-along player assets (shared ES modules copied from the reader; step 3 will
 # formalize these into one nullsix package). Resolved beside this script — stable
@@ -312,11 +315,17 @@ PAGE = r"""<!DOCTYPE html>
   <div class="sect">Voice</div>
   <label>Engine</label>
   <select id="cfgEngine">
+    <option value="inworld">Inworld</option>
+    <option value="kokoro-deepinfra">Kokoro (DeepInfra)</option>
     <option value="openai">OpenAI</option>
     <option value="deepgram">Deepgram</option>
     <option value="elevenlabs">ElevenLabs</option>
     <option value="unreal">Unreal Speech</option>
   </select>
+  <label>Inworld voice</label>
+  <select id="cfgInworldVoice"></select>
+  <label>Kokoro voice</label>
+  <select id="cfgKokoroVoice"></select>
   <label>OpenAI voice</label>
   <select id="cfgVoice"></select>
   <label>Unreal voice</label>
@@ -391,6 +400,7 @@ function renderTurn(t){
   const card = document.createElement("div");
   card.className = "turn"; card.dataset.id = t.id;
   card._text = t.text || "";
+  card._hasAudio = !!t.audio_url;   // whole-turn audio already cached server-side
   // Speak + timestamp sit at the card bottom but STICK to the bottom of the
   // screen (.turn > .row is position:sticky) so Speak is always in view no matter
   // where you are in a long turn — no scroll-hunting for it. This mirrors the
@@ -421,8 +431,11 @@ function mountPlayer(card, {onDone=null}={}){
   // own transport is sticky-bottom too, so leaving the row visible would stack two
   // sticky bars at the screen bottom.
   const row = card.querySelector(":scope > .row"); if(row) row.style.display="none";
+  // Cached whole-turn audio (listen-mode pre-synth) plays as one chunk — it's
+  // already instant. Fresh turns take the progressive chunked path: playback
+  // starts on chunk 1 while the rest synthesizes.
   card._player = window.mountReadAlong(card.querySelector(".player"),
-    {session:active, turnId:card.dataset.id, text, onDone});
+    {session:active, turnId:card.dataset.id, text, whole:card._hasAudio, onDone});
   return card._player;
 }
 
@@ -438,6 +451,7 @@ function openStream(id){
       const card = $(`.turn[data-id="${cssEsc(t.id)}"]`);
       if(card){
         card._text = t.text || card._text;
+        if(t.audio_url) card._hasAudio = true;
         const body = card.querySelector(".body");
         if(body && !card._player) body.innerHTML = t.html||"";
       }
@@ -485,22 +499,27 @@ $("#listenToggle").onchange = async e => {
 };
 
 // ---- settings ----
+function fillVoices(sel, voices, current){
+  sel.innerHTML="";
+  (voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
+    if(v===current) o.selected=true; sel.appendChild(o); });
+}
 async function loadConfig(){
   const r = await fetch("/config"); const c = await r.json();
-  const vsel = $("#cfgVoice"); vsel.innerHTML="";
-  (c.voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
-    if(v===c.voice) o.selected=true; vsel.appendChild(o); });
-  const usel = $("#cfgUnrealVoice"); usel.innerHTML="";
-  (c.unreal_voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
-    if(v===c.unreal_voice) o.selected=true; usel.appendChild(o); });
-  $("#cfgEngine").value = c.engine||"openai";
+  fillVoices($("#cfgVoice"), c.voices, c.voice);
+  fillVoices($("#cfgUnrealVoice"), c.unreal_voices, c.unreal_voice);
+  fillVoices($("#cfgInworldVoice"), c.inworld_voices, c.inworld_voice);
+  fillVoices($("#cfgKokoroVoice"), c.kokoro_voices, c.kokoro_voice);
+  $("#cfgEngine").value = c.engine||"inworld";
 }
 $("#menuBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
 $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
 $("#cfgSave").onclick = async ()=>{
   await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
     body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
-                          unreal_voice:$("#cfgUnrealVoice").value})});
+                          unreal_voice:$("#cfgUnrealVoice").value,
+                          inworld_voice:$("#cfgInworldVoice").value,
+                          kokoro_voice:$("#cfgKokoroVoice").value})});
   toast("Saved"); $("#panel").classList.remove("open");
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
@@ -581,7 +600,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),
                                     "speed": cfg.get("speed"), "voices": OPENAI_VOICES,
                                     "unreal_voice": cfg.get("unreal_voice"),
-                                    "unreal_voices": UNREAL_VOICES})
+                                    "unreal_voices": UNREAL_VOICES,
+                                    "inworld_voice": cfg.get("inworld_voice"),
+                                    "inworld_voices": INWORLD_VOICES,
+                                    "kokoro_voice": cfg.get("kokoro_voice"),
+                                    "kokoro_voices": KOKORO_VOICES})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})
@@ -611,6 +634,9 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if not body:
                 return self._json(400, {"error": "bad json"})
+            if "text" in body and "i" in body:
+                return self._tts_chunk(body.get("session", ""), body.get("turn", ""),
+                                       body.get("i"), body.get("text", ""))
             return self._tts(body.get("session", ""), body.get("turn", ""))
         if path == "/config":
             body = self._body()
@@ -656,7 +682,30 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as ex:
             return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
         resp = {"url": f"/audio/{turn_id}.mp3", "duration": dur}
-        words = core.load_words(turn_id)   # unreal per-word timestamps, if any
+        words = core.load_words(turn_id)   # per-word timestamps, if the engine has them
+        if words:
+            resp["words"] = words
+        return self._json(200, resp)
+
+    # Progressive path: the client chunks the turn itself (chunker.js ramp) and
+    # requests each piece, so playback starts on chunk 1 instead of after the
+    # whole turn renders. The chunk text is client-supplied — the cache key
+    # hashes it, and the server is tailnet-only, so that's acceptable.
+    def _tts_chunk(self, session_id, turn_id, i, text):
+        if not (ID_RE.match(session_id or "") and ID_RE.match(turn_id or "")):
+            return self._json(400, {"error": "bad request"})
+        try:
+            i = int(i)
+        except (TypeError, ValueError):
+            return self._json(400, {"error": "bad chunk index"})
+        text = (text or "").strip()
+        if not (0 <= i < 500) or not (0 < len(text) <= 4000):
+            return self._json(400, {"error": "bad chunk"})
+        try:
+            path, dur, words = core.synth_turn_chunk(turn_id, i, text)
+        except Exception as ex:
+            return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
+        resp = {"url": f"/audio/{os.path.basename(path)}", "duration": dur}
         if words:
             resp["words"] = words
         return self._json(200, resp)
@@ -735,10 +784,14 @@ class Handler(BaseHTTPRequestHandler):
     # ---- audio with Range (iOS Safari needs 206) ----
     def serve_audio(self, name):
         name = os.path.basename(name)
-        m = re.match(r"^([A-Za-z0-9_-]+)\.mp3$", name)
-        if not m:
+        if re.match(r"^[A-Za-z0-9_-]+\.mp3$", name):
+            # bare turn id → whole-turn cache file for the current engine/voice
+            fpath = core.audio_path_for(name[:-4])
+        elif re.match(r"^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)+\.mp3$", name):
+            # fully-qualified cache filename (chunk files; /tts returns these)
+            fpath = os.path.join(core.AUDIO_CACHE, name)
+        else:
             return self._send(404, "not found", ctype="text/plain")
-        fpath = core.audio_path_for(m.group(1))
         if not os.path.isfile(fpath):
             return self._send(404, "not found", ctype="text/plain")
         size = os.path.getsize(fpath)

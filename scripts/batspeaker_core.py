@@ -24,13 +24,15 @@ AUDIO_CACHE = os.path.join(HOME, ".cache", "batspeaker", "audio")
 TTS = os.path.join(HOME, ".local", "bin", "tts")
 
 DEFAULTS = {
-    "engine": "openai",    # openai | deepgram | elevenlabs | unreal
+    "engine": "inworld",   # inworld | kokoro-deepinfra | openai | deepgram | elevenlabs | unreal
     "voice": "ash",        # OpenAI voice
     "model": "tts-1-hd",   # OpenAI model
     "deepgram_voice": "orpheus",
     "elevenlabs_voice": "nPczCjzI2devNBz1zQrb",
     "elevenlabs_model": "eleven_multilingual_v2",
     "unreal_voice": "Scarlett",   # Unreal Speech: Scarlett|Dan|Liv|Will|Amy
+    "inworld_voice": "Malcolm",   # voice verdict 2026-07-14 ("probably the most Bruce")
+    "kokoro_voice": "af_heart",   # DeepInfra-hosted Kokoro (the reader's default voice)
     "speed": "1.0",
 }
 
@@ -661,6 +663,110 @@ def synth_unreal(text, voice, out, words_out=None):
         _write_words(words_out, all_words if ok else [])
 
 
+# Inworld TTS-2 (engine verdict 2026-07-14): true PAYG ($10/M chars) with native
+# per-word timestamps in the same response — no second request, no fuzzy token
+# alignment needed beyond the shared _align_words walk.
+INWORLD_URL = "https://api.inworld.ai/tts/v1/voice"
+INWORLD_CHUNK = 2000               # API rejects requests over 2,000 chars
+# Auditioned male roster, verdict order: Malcolm won; the rest are Kyle's
+# good-list + the round-3 field. Full roster (261) via GET /tts/v1/voices.
+INWORLD_VOICES = ["Malcolm", "Blake", "Hades", "Elliot", "Victor", "Cedric",
+                  "Conrad", "Jake", "Clive", "Alaric", "Damon", "Levi"]
+
+
+def _inworld_one(text, voice, out):
+    """Synthesize one chunk to `out` and return Inworld's word tokens as
+    [{word,start,end}] (chunk-local seconds). The API tokenizes generously —
+    leading silence as '', whitespace runs and punctuation as their own tokens —
+    so whitespace-only tokens are dropped here and the rest are left for
+    _align_words, whose alnum walk skips pure-punctuation tokens naturally."""
+    import urllib.request
+    key = get_env("INWORLD_API_KEY")
+    if not key:
+        raise RuntimeError("INWORLD_API_KEY not found")
+    # The stored value is the ready-made base64 Basic credential, sometimes
+    # quote-wrapped depending on how the env reached us — strip or the API 403s.
+    key = key.strip().strip("\"'")
+    body = {"text": text, "voiceId": voice, "modelId": "inworld-tts-2",
+            "audioConfig": {"audioEncoding": "MP3"}, "timestampType": "WORD"}
+    req = urllib.request.Request(
+        INWORLD_URL, data=json.dumps(body).encode(),
+        headers={"Authorization": f"Basic {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        d = json.loads(resp.read())
+    audio_b64 = d.get("audioContent")
+    if not audio_b64:
+        raise RuntimeError(f"inworld: no audioContent ({str(d)[:150]})")
+    import base64
+    with open(out, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+    wa = (d.get("timestampInfo") or {}).get("wordAlignment") or {}
+    toks = zip(wa.get("words") or [], wa.get("wordStartTimeSeconds") or [],
+               wa.get("wordEndTimeSeconds") or [])
+    return [{"word": w, "start": s, "end": e} for w, s, e in toks if w.strip()]
+
+
+def synth_inworld(text, voice, out, words_out=None):
+    """Whole-turn Inworld synthesis, mirroring synth_unreal: chunk at the API
+    cap, stitch audio, offset each chunk's word timestamps by the running
+    duration. Falls back to the estimate (empty words file) if any chunk's
+    tokens can't be aligned to the text's whitespace split."""
+    text = re.sub(r"\s+", " ", text).strip()
+    chunks = chunk_text(text, INWORLD_CHUNK)
+    want = words_out is not None
+    parts, all_words, offset, ok = [], [], 0.0, True
+    for i, c in enumerate(chunks):
+        p = out if len(chunks) == 1 else out.replace(".mp3", f".part{i}.mp3")
+        toks = _inworld_one(c, voice, p)
+        parts.append(p)
+        if want:
+            aligned = _align_words(toks, c.split())
+            if aligned is None:
+                ok = False
+            else:
+                for w in aligned:
+                    all_words.append({"word": w["word"],
+                                      "start": round(w["start"] + offset, 3),
+                                      "end": round(w["end"] + offset, 3)})
+            offset += _duration_f(p) or 0.0
+    if len(chunks) > 1:
+        concat_mp3s(parts, out)
+        for p in parts:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+    if want:
+        _write_words(words_out, all_words if ok else [])
+
+
+# DeepInfra-hosted Kokoro: the voice Kyle loves at ~$0.62/M chars, kept one
+# dropdown away as the budget seat. No word timestamps — estimate highlight.
+KOKORO_VOICES = ["af_heart", "af_bella", "af_nicole", "am_michael", "am_adam",
+                 "am_fenrir", "bm_george", "bm_lewis"]
+
+
+def synth_kokoro_deepinfra(text, voice, out):
+    import urllib.request, base64
+    key = get_env("DEEPINFRA_API_KEY")
+    if not key:
+        raise RuntimeError("DEEPINFRA_API_KEY not found")
+    req = urllib.request.Request(
+        "https://api.deepinfra.com/v1/inference/hexgrad/Kokoro-82M",
+        data=json.dumps({"text": text, "preset_voice": [voice],
+                         "output_format": "mp3"}).encode(),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as resp:
+        d = json.loads(resp.read())
+    audio = d.get("audio") or ""
+    if audio.startswith("data:"):          # data:audio/mp3;base64,....
+        audio = audio.split(",", 1)[-1]
+    if not audio:
+        raise RuntimeError(f"kokoro-deepinfra: no audio ({str(d)[:150]})")
+    with open(out, "wb") as f:
+        f.write(base64.b64decode(audio))
+
+
 def synth(text, cfg=None, out=None):
     """Render `text` to mp3 `out` via the configured engine, always at 1x.
     Playback speed is applied client-side (pitch-preserved playbackRate) by the
@@ -686,6 +792,10 @@ def synth(text, cfg=None, out=None):
         synth_elevenlabs(text, cfg["elevenlabs_voice"], cfg["elevenlabs_model"], out)
     elif engine == "unreal":
         synth_unreal(text, cfg["unreal_voice"], out, words_out=out + ".words.json")
+    elif engine == "inworld":
+        synth_inworld(text, cfg["inworld_voice"], out, words_out=out + ".words.json")
+    elif engine == "kokoro-deepinfra":
+        synth_kokoro_deepinfra(text, cfg["kokoro_voice"], out)
     else:
         raise RuntimeError(f"unknown engine: {engine}")
     # apply_speed retired: synth is 1x, the player owns speed. (function kept for
@@ -714,6 +824,8 @@ def _variant_tag(cfg):
         "deepgram": cfg.get("deepgram_voice"),
         "elevenlabs": cfg.get("elevenlabs_voice"),
         "unreal": cfg.get("unreal_voice"),
+        "inworld": cfg.get("inworld_voice"),
+        "kokoro-deepinfra": cfg.get("kokoro_voice"),
     }.get(engine) or ""
     return re.sub(r"[^A-Za-z0-9_.-]", "", f"{engine}-{voice}")
 
@@ -741,17 +853,77 @@ def load_words(turn_id, cfg=None):
     return None
 
 
+# Engines whose synthesis also yields real per-word timestamps.
+WORD_ENGINES = {"unreal", "inworld"}
+
+
 def synth_turn(turn_id, text, cfg=None):
     """Synthesize (and cache) a turn's audio. Returns (audio_path, duration_s).
-    Reuses the cached mp3 — but for unreal, a hit also requires the words sidecar,
-    so turns cached before word-timestamps existed re-synth once to gain them."""
+    Reuses the cached mp3 — but for word-timestamp engines, a hit also requires
+    the words sidecar, so turns cached before word-timestamps existed re-synth
+    once to gain them."""
     cfg = cfg or load_config()
     os.makedirs(AUDIO_CACHE, exist_ok=True)
     out = audio_path_for(turn_id, cfg)
-    words_ok = cfg.get("engine") != "unreal" or os.path.exists(out + ".words.json")
+    words_ok = (cfg.get("engine") not in WORD_ENGINES
+                or os.path.exists(out + ".words.json"))
     if os.path.exists(out) and os.path.getsize(out) > 0 and words_ok:
         return out, duration(out)
     synth(text, cfg, out)
     if not (os.path.exists(out) and os.path.getsize(out) > 0):
         raise RuntimeError("no audio produced")
     return out, duration(out)
+
+
+# ---------- chunk-level synthesis (progressive playback) ----------
+
+def chunk_audio_path(turn_id, i, text, cfg=None):
+    """Cache path for one client-chunked piece of a turn. Keyed by chunk index +
+    a hash of the chunk text (so edited turns or a retuned chunker re-synth) +
+    the engine/voice variant — never stale, at worst re-billed."""
+    import hashlib
+    cfg = cfg or load_config()
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", turn_id)[:120] or "turn"
+    h = hashlib.sha1(text.encode()).hexdigest()[:8]
+    return os.path.join(AUDIO_CACHE, f"{safe}.c{i}.{h}.{_variant_tag(cfg)}.mp3")
+
+
+def synth_chunk(text, cfg, out, words_out):
+    """Synthesize one already-chunked piece of text (the client's chunker caps
+    pieces well under every engine's request limit, so each is a single API
+    call). Word-timestamp engines write a chunk-LOCAL words sidecar — the player
+    re-anchors timings per chunk, so no cross-chunk offsetting is needed."""
+    engine = cfg.get("engine", "openai")
+    text = re.sub(r"\s+", " ", text).strip()
+    if engine == "inworld":
+        toks = _inworld_one(text, cfg["inworld_voice"], out)
+        _write_words(words_out, _align_words(toks, text.split()) or [])
+    elif engine == "unreal":
+        toks = _unreal_one(text, cfg["unreal_voice"], out, want_words=True)
+        aligned = _align_words(toks, text.split()) if toks is not None else None
+        _write_words(words_out, aligned or [])
+    else:
+        synth(text, cfg, out)
+
+
+def synth_turn_chunk(turn_id, i, text, cfg=None):
+    """Synthesize (and cache) one chunk of a turn. Returns (path, duration_s,
+    words|None). words is chunk-local [{word,start,end}] or None when the
+    engine only supports the estimate highlight."""
+    cfg = cfg or load_config()
+    os.makedirs(AUDIO_CACHE, exist_ok=True)
+    out = chunk_audio_path(turn_id, i, text, cfg)
+    words_ok = (cfg.get("engine") not in WORD_ENGINES
+                or os.path.exists(out + ".words.json"))
+    if not (os.path.exists(out) and os.path.getsize(out) > 0 and words_ok):
+        synth_chunk(text, cfg, out, out + ".words.json")
+    if not (os.path.exists(out) and os.path.getsize(out) > 0):
+        raise RuntimeError("no audio produced")
+    words = None
+    if cfg.get("engine") in WORD_ENGINES:
+        try:
+            with open(out + ".words.json") as f:
+                words = json.load(f) or None
+        except Exception:
+            words = None
+    return out, _duration_f(out), words

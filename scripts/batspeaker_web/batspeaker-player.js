@@ -1,17 +1,22 @@
-// Bat-Speaker adoption of the shared ReadAlong player (2026-07-03, step 2).
+// Bat-Speaker adoption of the shared ReadAlong player (2026-07-03, step 2;
+// progressive chunked synthesis 2026-07-14, the planned fast-follow).
 //
 // Replaces the native <audio controls> per-turn play path with a real read-along
 // player: big transport, scrub, click-to-seek, and client-side pitch-preserved
 // speed (persisted). Exposes window.mountReadAlong for the page's inline script.
 //
-// v1 is deliberately whole-turn: one /tts call → one /audio mp3 → one chunk, with
-// the length-weighted estimate highlight. The fast-follow swaps this source for a
-// chunk-level one that returns Unreal's real per-word timestamps (sample-accurate
-// highlight + progressive TTFA). The player itself won't change — that's the point
-// of the seam.
+// Two source modes behind the same synthChunk seam:
+//   whole   one /tts call → one /audio mp3 → one chunk. Used when the server
+//           already has the turn cached (listen-mode pre-synth) — instant.
+//   chunked the client splits the turn (chunker.js ramp 140→260→400) and
+//           requests each piece from /tts; playback starts on chunk 1 while the
+//           rest synthesizes. Word-timestamp engines (inworld, unreal) return
+//           chunk-local timings per piece — sample-accurate highlight with no
+//           cross-chunk offset math.
 
 import { ReadAlong } from "./readalong.js";
 import { silence } from "./audioutil.js";
+import { chunkText } from "./chunker.js";
 
 function deferred() {
   let resolve, reject;
@@ -23,18 +28,41 @@ function esc(s) {
   return (s || "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 }
 
-// v1: the whole turn is a single chunk. Word-spans come from the SAME spoken
-// text the server synthesizes (turn_spoken_text), so the highlight tracks the
-// audio's word order. Estimate highlight spans the whole turn's duration.
-function prepareOne(text) {
-  const words = (text || "").split(/\s+/).filter(Boolean);
-  const html = words.map((w, i) => `<span class="w" data-c="0" data-w="${i}">${esc(w)}</span>`).join(" ");
-  return { html, chunks: [words] };
+// Word-spans come from the SAME spoken text the server synthesizes
+// (turn_spoken_text), so the highlight tracks the audio's word order.
+function spanHTML(chunks) {
+  return chunks.map((words, c) =>
+    words.map((w, i) => `<span class="w" data-c="${c}" data-w="${i}">${esc(w)}</span>`).join(" ")
+  ).join(" ");
 }
 
-// Synth source: fetch the whole turn's 1x mp3 from Bat-Speaker's /tts and hand
-// the player a single chunk. Matches the KokoroWorkerSource/CloudUnrealSource
-// contract (attach / begin / synthChunk / cancel).
+// whole-turn mode: a single chunk spanning the turn.
+function prepareOne(text) {
+  const words = (text || "").split(/\s+/).filter(Boolean);
+  return { html: spanHTML([words]), chunks: [words] };
+}
+
+// chunked mode: chunker.js ramps 140→260→400 chars so chunk 1 synthesizes fast
+// (TTFA) and later chunks amortize request overhead.
+function prepareChunked(text) {
+  const chunks = chunkText(text || "")
+    .map(c => c.split(/\s+/).filter(Boolean))
+    .filter(w => w.length);
+  return { html: spanHTML(chunks), chunks };
+}
+
+// Real per-word timestamps only when they line up 1:1 with the chunk's rendered
+// word-spans; otherwise the player's length-weighted estimate takes over.
+function realTimings(words, spanWords) {
+  const api = words || [];
+  return (api.length && api.length === spanWords.length)
+    ? api.map(w => ({ start: w.start, end: w.end }))
+    : null;
+}
+
+// Synth source: fetch turn audio from Bat-Speaker's /tts. Matches the
+// KokoroWorkerSource/CloudUnrealSource contract (attach / begin / synthChunk /
+// cancel). opts.whole picks the single-call path over per-chunk calls.
 class BatSpeakerSource {
   constructor(opts) { this.opts = opts; this.ctx = { status() {}, log() {} }; this.job = null; this.slots = []; }
   attach(ctx) { this.ctx = ctx; }
@@ -42,33 +70,32 @@ class BatSpeakerSource {
     this.job = job;
     job.durations = job.durations || new Array(job.texts.length).fill(null);
     this.slots = job.texts.map(() => deferred());
-    this._run(job);
+    if (this.opts.whole) this._runWhole(job);
+    else this._runChunked(job);
   }
   synthChunk(i) {
     return this.slots[i] ? this.slots[i].promise
       : Promise.resolve({ audioUrl: silence(), wordTimings: null, duration: 0.2 });
   }
   cancel() { this.job = null; }
-  async _run(job) {
+
+  async _post(body) {
+    const r = await fetch("/tts", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok || d.error || !d.url) throw new Error(d.error || `HTTP ${r.status}`);
+    return d;
+  }
+
+  async _runWhole(job) {
     this.ctx.status("synthesizing…");
     try {
-      const r = await fetch("/tts", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session: this.opts.session, turn: this.opts.turnId }),
-      });
-      const d = await r.json();
+      const d = await this._post({ session: this.opts.session, turn: this.opts.turnId });
       if (this.job !== job) return;
-      if (!r.ok || d.error || !d.url) throw new Error(d.error || `HTTP ${r.status}`);
       const duration = d.duration || 0.2;
-      job.durations[0] = duration;
-      // Real Unreal per-word timestamps → sample-accurate highlight, but only if
-      // they line up 1:1 with the rendered word-spans; otherwise let the player's
-      // length-weighted estimate take over.
-      const span = (job.chunks[0] && job.chunks[0].words) || [];
-      const api = d.words || [];
-      const timings = (api.length && api.length === span.length)
-        ? api.map(w => ({ start: w.start, end: w.end }))
-        : null;
+      const timings = realTimings(d.words, (job.chunks[0] && job.chunks[0].words) || []);
       this.slots[0].resolve({ audioUrl: d.url, wordTimings: timings, duration });
       this.ctx.status("");
       this.ctx.log(`tts ok: ${duration}s${timings ? `, ${timings.length} real word timings` : " (estimate)"}`);
@@ -80,16 +107,41 @@ class BatSpeakerSource {
       this.slots[0].resolve({ audioUrl: silence(), wordTimings: null, duration: 0.2 });
     }
   }
+
+  // Sequential per-chunk requests: the server synthesizes serially anyway, and
+  // in-order arrival keeps the playable prefix growing from the front. A failed
+  // chunk resolves as a blip of silence so the rest of the turn still plays.
+  async _runChunked(job) {
+    for (let i = 0; i < job.texts.length; i++) {
+      if (this.job !== job) return;
+      this.ctx.status(`synthesizing ${i + 1}/${job.texts.length}…`);
+      try {
+        const d = await this._post({
+          session: this.opts.session, turn: this.opts.turnId,
+          i, n: job.texts.length, text: job.texts[i],
+        });
+        if (this.job !== job) return;
+        const timings = realTimings(d.words, job.chunks[i].words);
+        this.slots[i].resolve({ audioUrl: d.url, wordTimings: timings, duration: d.duration || 0.2 });
+        this.ctx.log(`chunk ${i + 1}/${job.texts.length}: ${d.duration}s${timings ? `, ${timings.length} word timings` : " (estimate)"}`);
+      } catch (e) {
+        if (this.job !== job) return;
+        this.ctx.log(`chunk ${i + 1} failed: ${e.message}`);
+        this.slots[i].resolve({ audioUrl: silence(), wordTimings: null, duration: 0.2 });
+      }
+    }
+    if (this.job === job) this.ctx.status("");
+  }
 }
 
 // Mount a player into `root` for one turn and start it. Returns the ReadAlong
-// instance. opts: { session, turnId, text, voice, onDone }.
+// instance. opts: { session, turnId, text, whole, onDone }.
 window.mountReadAlong = function (root, opts) {
   const source = new BatSpeakerSource({
-    session: opts.session, turnId: opts.turnId, getVoice: opts.getVoice || (() => opts.voice),
+    session: opts.session, turnId: opts.turnId, whole: !!opts.whole,
   });
   const player = new ReadAlong(root, source, {
-    prepare: t => prepareOne(t),
+    prepare: t => (opts.whole ? prepareOne(t) : prepareChunked(t)),
     getMd: () => false,
     compact: true,          // phone-first: one control line + speed stepper
     speedKey: "batspeaker.speed",
