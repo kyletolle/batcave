@@ -810,6 +810,64 @@ def cmd_uncomplete(args):
         print(f"Reopened task {args.task_id}.")
 
 
+def cmd_delete(args):
+    """Delete task(s) permanently. Irreversible — requires --yes to execute.
+
+    Distinct from `complete`: a completed task still exists in Todoist and can
+    be reopened with `uncomplete`. A deleted one is gone, and the audit log is
+    the ONLY remaining record of it — so the full snapshot is written before
+    the API call, not after.
+
+    Deleting a parent takes its subtasks with it server-side, so children are
+    enumerated up front and recorded in the audit entry.
+    """
+    tasks = api_get("tasks")
+    by_id = {t["id"]: t for t in tasks}
+
+    targets = []
+    for tid in args.task_ids:
+        task = by_id.get(tid)
+        if task:
+            targets.append(task)
+        else:
+            print(f"  SKIP: Task {tid} not found.")
+
+    if not targets:
+        print("Nothing to delete.")
+        sys.exit(1)
+
+    cascade = {t["id"]: get_subtasks(t["id"], all_tasks=tasks) for t in targets}
+    total_children = sum(len(c) for c in cascade.values())
+
+    if not args.yes:
+        print(f"About to permanently DELETE {len(targets)} task(s):")
+        for t in targets:
+            due = t.get("due")
+            due_str = f" (due: {due.get('string') or due.get('date')})" if due else ""
+            print(f"  - {t['content']}{due_str}  id: {t['id']}")
+            for c in cascade[t["id"]]:
+                print(f"      subtask: {c['content']}  id: {c['id']}")
+        if total_children:
+            print(f"\n  {total_children} subtask(s) go with their parent(s).")
+        print("\n  IRREVERSIBLE — unlike 'complete', there is no reopening this.")
+        print("  Re-run with --yes to confirm.")
+        sys.exit(1)
+
+    deleted = 0
+    for t in targets:
+        children = cascade[t["id"]]
+        extra = {"cascade_children": [task_snapshot(c) for c in children]} if children else None
+        # Log BEFORE the delete — afterwards the task can no longer be fetched.
+        log_mutation("delete", task_before=t, extra=extra)
+        api_delete(f"tasks/{t['id']}")
+        print(f"  Deleted: '{t['content']}'  id: {t['id']}")
+        if children:
+            print(f"    (took {len(children)} subtask(s) with it)")
+        deleted += 1
+
+    print(f"\nDone: {deleted} deleted, {len(args.task_ids) - deleted} skipped.")
+
+
 def cmd_search(args):
     pmap = project_map()
 
@@ -1379,6 +1437,11 @@ def main():
     p_uncomplete = sub.add_parser("uncomplete", help="Reopen a completed task (undo a complete)")
     p_uncomplete.add_argument("task_id", help="Task ID to reopen")
 
+    # delete
+    p_delete = sub.add_parser("delete", help="Delete task(s) permanently (irreversible)")
+    p_delete.add_argument("task_ids", nargs="+", help="Task ID(s) to delete")
+    p_delete.add_argument("--yes", action="store_true", help="Confirm deletion (required)")
+
     # search
     p_search = sub.add_parser("search", help="Search tasks by content")
     p_search.add_argument("query", help="Search query")
@@ -1456,6 +1519,7 @@ def main():
         "postpone": cmd_postpone,
         "complete": cmd_complete,
         "uncomplete": cmd_uncomplete,
+        "delete": cmd_delete,
         "search": cmd_search,
         "sections": cmd_sections,
         "add-section": cmd_add_section,
