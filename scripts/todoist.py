@@ -559,6 +559,8 @@ def cmd_update(args):
         payload["priority"] = args.priority
     if args.description is not None:
         payload["description"] = args.description
+    if args.labels is not None:
+        payload["labels"] = args.labels
 
     if getattr(args, "no_deadline", False):
         payload["deadline_date"] = None
@@ -568,7 +570,7 @@ def cmd_update(args):
         payload["deadline_lang"] = "en"
 
     if not payload:
-        print("Nothing to update. Use --due, --content, --priority, --description, or --deadline.")
+        print("Nothing to update. Use --due, --content, --priority, --description, --labels, or --deadline.")
         sys.exit(1)
 
     pmap = project_map()
@@ -1065,7 +1067,7 @@ def cmd_bulk(args):
        "parent":"ID","due":"...","priority":N,"description":"...",
        "labels":[...],"deadline":"...","child_order":N}
       {"op":"update","id":"...","content":"...","priority":N,
-       "description":"...","due":"...","deadline":"..."}
+       "description":"...","labels":[...],"due":"...","deadline":"..."}
       {"op":"move-section","id":"...","section":"Name"}   # section in task's own project
       {"op":"move-parent","id":"...","parent":"ID"}       # nest task under parent (same project)
 
@@ -1127,7 +1129,8 @@ def cmd_bulk(args):
                     raise ValueError(f"task {op.get('id')} not found")
                 payload = {}
                 for src, dst in (("content", "content"), ("priority", "priority"),
-                                 ("description", "description"), ("due", "due_string")):
+                                 ("description", "description"), ("labels", "labels"),
+                                 ("due", "due_string")):
                     if op.get(src) is not None:
                         payload[dst] = op[src]
                 if op.get("deadline"):
@@ -1361,6 +1364,8 @@ def main():
     p_update.add_argument("--content", "-c", help="New task content")
     p_update.add_argument("--priority", type=int, choices=[1, 2, 3, 4], help="New priority")
     p_update.add_argument("--description", help="New description")
+    p_update.add_argument("--labels", nargs="*",
+                          help="Replace labels (space-separated; bare --labels clears all)")
     p_update.add_argument("--deadline", help="New deadline date (tomorrow, friday, +3, 2026-03-15)")
     p_update.add_argument("--no-deadline", action="store_true", help="Remove deadline")
     p_update.add_argument("--force", action="store_true",
