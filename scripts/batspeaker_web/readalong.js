@@ -12,6 +12,9 @@
 //             wordTimings|null, duration}
 //     opts    { prepare(text, md) → {html, chunks:[[word]]},
 //               getMd?() → bool, presets?, speedKey?, defaultSpeed?,
+//               compact?: bool (single-line transport + speed stepper),
+//               focus?: bool (offer the focus-mode ribbon), focusKey?,
+//               focusStyleKey?,
 //               onStatus?(msg), onLog?(msg), onFirstAudio?(ms), onNewText?() }
 //
 // The player drives synthesis through the source only; it never knows whether a
@@ -21,9 +24,24 @@ import { silence, fmt } from "./audioutil.js";
 
 const DEFAULT_PRESETS = [1, 1.25, 1.5, 1.75, 2, 2.5, 2.75, 3];
 
-function controlsHTML(withNewText) {
+// Focus-mode view: shared by both control variants. The ribbon (bump style)
+// and the rsvp trio (still style) live side by side; the active style shows one.
+function focusHTML() {
+  return `
+  <div class="ra-focus hidden">
+    <div class="ra-focus-win">
+      <div class="ra-ribbon"></div>
+      <div class="ra-rsvp hidden">
+        <span class="w rs-prev"></span><span class="w rs-cur"></span><span class="w rs-next"></span>
+      </div>
+    </div>
+  </div>`;
+}
+
+function controlsHTML(withNewText, withFocus) {
   return `
   <div class="ra-pane"></div>
+  ${withFocus ? focusHTML() : ""}
   <div class="ra-controls">
     <input class="scrub ra-scrub" type="range" min="0" max="0" step="0.05" value="0">
     <div class="row">
@@ -42,6 +60,8 @@ function controlsHTML(withNewText) {
     <div class="row speeds ra-speeds"></div>
     <div class="row">
       ${withNewText ? `<button data-ra="newText">‹ New text</button>` : ""}
+      ${withFocus ? `<button data-ra="focus" title="Focus mode — the text flows past a fixed point (f)">Focus</button>
+      <button data-ra="fstyle" class="hidden" title="Focus style — Bump slides the line one word at a time; Still swaps the word in place with no motion">Bump</button>` : ""}
       <button data-ra="stop">Stop</button>
     </div>
   </div>`;
@@ -51,9 +71,10 @@ function controlsHTML(withNewText) {
 // play / 10›, a prev/next speed stepper, time, stop. Drops «15 / 30» / replay to
 // fit narrow screens. The speed stepper (see _renderSpeeds) steps through the
 // presets and clamps at the ends, so 3× steps down to 2.75× rather than wrapping.
-function compactControlsHTML() {
+function compactControlsHTML(withFocus) {
   return `
   <div class="ra-pane"></div>
+  ${withFocus ? focusHTML() : ""}
   <div class="ra-controls compact">
     <input class="scrub ra-scrub" type="range" min="0" max="0" step="0.05" value="0">
     <div class="row transport compact-bar">
@@ -61,10 +82,14 @@ function compactControlsHTML() {
       <button class="round primary" data-ra="play" title="Play / pause">▶</button>
       <button class="icon" data-ra="fwd10" title="Forward 10s">10›</button>
       <span class="ra-speeds spd-stepper"></span>
+      ${withFocus ? `<button class="icon" data-ra="focus" title="Focus mode — the text flows past a fixed point">◎</button>` : ""}
       <span class="time ra-time">0:00 / 0:00</span>
       <button class="icon" data-ra="stop" title="Stop">⏹</button>
     </div>
-    <div class="row"><span class="status ra-status"></span></div>
+    <div class="row">
+      ${withFocus ? `<button class="icon hidden" data-ra="fstyle" title="Focus style — Bump slides the line one word at a time; Still swaps the word in place with no motion">Bump</button>` : ""}
+      <span class="status ra-status"></span>
+    </div>
   </div>`;
 }
 
@@ -84,6 +109,21 @@ export class ReadAlong {
     this.srcGen = 0;         // gen when the current audio.src was installed
     this.scrubbing = false;
     this._curWord = null;
+
+    // focus mode (the ribbon): opt-in via opts.focus, persisted per instance key
+    this.focusKey = opts.focusKey || "reader.focus";
+    this.focusOn = !!opts.focus && localStorage.getItem(this.focusKey) === "1";
+    this.focusStyleKey = opts.focusStyleKey || "reader.focusStyle";
+    this.focusStyle = localStorage.getItem(this.focusStyleKey) === "still" ? "still" : "bump";
+    this._rsvpG = -1;          // flat word index currently shown by the still style
+    this._raf = 0;             // rAF handle for the ribbon loop
+    this._ribX = null;         // ribbon rest position (px into the line)
+    this._ribbonJobId = null;  // job the ribbon DOM was built for
+    this._ribSpans = null;     // flat span list, global word order
+    this._centers = null;      // center-x of each span within the ribbon
+    this._chunkBase = null;    // chunk index → first global word index
+    this._curRibbonWord = null;
+
     this.unlockPending = false;
     this.firstAudioReported = false;
     this.speakT0 = 0;
@@ -101,17 +141,22 @@ export class ReadAlong {
   /* ---- setup ---- */
   _build() {
     this.root.innerHTML = this.opts.compact
-      ? compactControlsHTML()
-      : controlsHTML(!!this.opts.onNewText);
+      ? compactControlsHTML(!!this.opts.focus)
+      : controlsHTML(!!this.opts.onNewText, !!this.opts.focus);
     const q = s => this.root.querySelector(s);
     this.el = {
       pane: q(".ra-pane"), controls: q(".ra-controls"), scrub: q(".ra-scrub"),
       time: q(".ra-time"), status: q(".ra-status"), speeds: q(".ra-speeds"),
       play: q('[data-ra="play"]'),
+      focus: q(".ra-focus"), focusWin: q(".ra-focus-win"), ribbon: q(".ra-ribbon"),
+      focusBtn: q('[data-ra="focus"]'), fstyleBtn: q('[data-ra="fstyle"]'),
+      rsvp: q(".ra-rsvp"), rsPrev: q(".rs-prev"), rsCur: q(".rs-cur"), rsNext: q(".rs-next"),
     };
 
     const on = (name, fn) => { const b = q(`[data-ra="${name}"]`); if (b) b.onclick = fn; };
     on("play", () => this.togglePlay());
+    on("focus", () => this.toggleFocus());
+    on("fstyle", () => this.toggleFocusStyle());
     on("stop", () => this.stop());
     on("replay", () => this.seek(this.offsets()[this.curIdx], true));   // restart current sentence
     on("back15", () => this.skip(-15));
@@ -126,14 +171,16 @@ export class ReadAlong {
     };
     this.el.scrub.onchange = () => { this.scrubbing = false; this.seek(+this.el.scrub.value); };
 
-    this.el.pane.addEventListener("click", e => {           // click any word → jump & play
+    const wordClick = e => {                                // click any word → jump & play
       const s = e.target.closest(".w");
-      if (!s || !this.job) return;
+      if (!s || !this.job || s.dataset.c == null) return;   // (empty rsvp neighbor has no target)
       const c = +s.dataset.c, w = +s.dataset.w;
       const t = this.wordTimings(c);
       if (t) this.seek(this.offsets()[c] + t[w].start, true);
       else this.gotoChunk(c, 0, true);   // chunk not synthesized yet — jump there and wait
-    });
+    };
+    this.el.pane.addEventListener("click", wordClick);
+    this.el.focus.addEventListener("click", wordClick);     // ribbon words seek too
 
     const audio = this.audio;
     audio.onplay = () => { this.el.play.textContent = "⏸"; };
@@ -155,6 +202,147 @@ export class ReadAlong {
     };
 
     this._renderSpeeds();
+    this._applyFocusView();   // restore a saved focus preference
+  }
+
+  /* ---- focus mode: the ribbon ----
+     One non-wrapping line of the whole text under a fixed focal point; the eye
+     stays put and the words come to it. The current word RESTS centered on the
+     focal mark and the ribbon bumps one whole word at a time when the spoken
+     word changes (continuous per-word interpolation was tried first and reads
+     as a blur at high speeds — 2026-07-24). Word boundaries come from the same
+     wordTimings() the highlight uses (real cloud timestamps or the length
+     estimate). Driven by rAF because audio timeupdate only fires a few times a
+     second and the bump easing needs frames. */
+  toggleFocus(force) {
+    if (!this.opts.focus) return;
+    this.focusOn = force != null ? !!force : !this.focusOn;
+    localStorage.setItem(this.focusKey, this.focusOn ? "1" : "0");
+    this._applyFocusView();
+  }
+
+  _applyFocusView() {
+    if (!this.opts.focus) return;
+    this.el.focus.classList.toggle("hidden", !this.focusOn);
+    this.el.pane.classList.toggle("hidden", this.focusOn);
+    this.el.focusBtn.classList.toggle("active", this.focusOn);
+    this.el.fstyleBtn.classList.toggle("hidden", !this.focusOn);
+    if (this.focusOn) { this._buildRibbon(); this._applyFocusStyle(); this._startRibbon(); }
+    else this._stopRibbon();
+  }
+
+  // Two focus styles, switchable mid-playback for side-by-side feel:
+  //   bump  — the ribbon line slides one word at a time (default)
+  //   still — RSVP: the word swaps in place at the focal point, zero motion,
+  //           dimmed prev/next neighbors for context
+  toggleFocusStyle() {
+    this.focusStyle = this.focusStyle === "still" ? "bump" : "still";
+    localStorage.setItem(this.focusStyleKey, this.focusStyle);
+    this._applyFocusStyle();
+  }
+
+  _applyFocusStyle() {
+    const still = this.focusStyle === "still";
+    this.el.ribbon.classList.toggle("hidden", still);
+    this.el.rsvp.classList.toggle("hidden", !still);
+    this.el.fstyleBtn.textContent = still ? "Still" : "Bump";
+    this._ribX = null;     // returning to bump snaps into place, no cross-doc glide
+    this._rsvpG = -1;      // re-render the rsvp words on the next frame
+  }
+
+  // Build the ribbon spans for the current job and measure each word's center.
+  // Must run while the ribbon is visible (offsetLeft is 0 inside display:none).
+  _buildRibbon() {
+    if (!this.job || this._ribbonJobId === this.job.id) return;
+    const rib = this.el.ribbon;
+    rib.style.transitionDuration = "0ms";   // never animate a new-job reset
+    rib.style.transform = "translate3d(0,0,0)";
+    rib.innerHTML = "";
+    this._ribSpans = []; this._chunkBase = [];
+    let g = 0;
+    for (const ch of this.job.chunks) {
+      this._chunkBase[ch.i] = g;
+      ch.words.forEach((w, wi) => {
+        const s = document.createElement("span");
+        s.className = "w";
+        s.dataset.c = ch.i; s.dataset.w = wi;
+        s.textContent = w;
+        rib.appendChild(s);
+        rib.appendChild(document.createTextNode(" "));
+        this._ribSpans.push(s);
+        g++;
+      });
+    }
+    // One layout pass for all centers. The ribbon may be hidden right now
+    // (still style) — centers measure as 0 inside display:none, so unhide for
+    // the measurement; _applyFocusStyle restores the right visibility.
+    const wasHidden = rib.classList.contains("hidden");
+    if (wasHidden) rib.classList.remove("hidden");
+    this._centers = this._ribSpans.map(s => s.offsetLeft + s.offsetWidth / 2);
+    if (wasHidden) rib.classList.add("hidden");
+    this._ribbonJobId = this.job.id;
+    this._ribX = null;          // snap to position on the next frame
+    this._curRibbonWord = null;
+  }
+
+  _startRibbon() {
+    if (this._raf) return;
+    const step = ts => { this._raf = requestAnimationFrame(step); this._ribbonFrame(ts); };
+    this._raf = requestAnimationFrame(step);
+  }
+  _stopRibbon() {
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this._raf = 0;
+  }
+
+  _ribbonFrame() {
+    if (!this.job || !this._centers || !this._centers.length) return;
+    const t = this.wordTimings(this.curIdx);       // null while chunk unsynthesized → hold
+    if (!t) return;
+    const localT = this.globalTime() - this.offsets()[this.curIdx];
+    let k = t.findIndex(s => localT < s.end);
+    if (k < 0) k = t.length - 1;
+    const g = this._chunkBase[this.curIdx] + k;
+
+    if (this.focusStyle === "still") { this._rsvpFrame(g); return; }
+    const target = this._centers[g];
+
+    if (target !== this._ribX) {
+      // The bump: write the transform ONCE per word change and let a CSS
+      // transition carry it — duration ~40% of the word's rate-adjusted
+      // airtime (words at 2.5× last ~140ms; a JS ease can't settle in that
+      // window, which read as a blur). The other ~60% is genuine stillness.
+      // Seeks and the first show snap: gliding would smear across the doc.
+      const wordMs = (t[k].end - t[k].start) / (this.speed || 1) * 1000;
+      const snap = this._ribX == null || Math.abs(target - this._ribX) > 1200;
+      this.el.ribbon.style.transitionDuration =
+        snap ? "0ms" : `${Math.max(30, Math.min(90, wordMs * 0.4)).toFixed(0)}ms`;
+      const mid = this.el.focusWin.clientWidth / 2;
+      this.el.ribbon.style.transform = `translate3d(${(mid - target).toFixed(2)}px,0,0)`;
+      this._ribX = target;
+    }
+
+    const span = this._ribSpans[g];
+    if (span && span !== this._curRibbonWord) {
+      if (this._curRibbonWord) this._curRibbonWord.classList.remove("cur");
+      span.classList.add("cur");
+      this._curRibbonWord = span;
+    }
+  }
+
+  // still style: swap the word in place — no motion at all. The hidden ribbon
+  // spans double as the flat word list (text + seek dataset).
+  _rsvpFrame(g) {
+    if (g === this._rsvpG) return;
+    this._rsvpG = g;
+    const fill = (el, span) => {
+      el.textContent = span ? span.textContent : "";
+      if (span) { el.dataset.c = span.dataset.c; el.dataset.w = span.dataset.w; }
+      else { delete el.dataset.c; delete el.dataset.w; }
+    };
+    fill(this.el.rsPrev, this._ribSpans[g - 1]);
+    fill(this.el.rsCur, this._ribSpans[g]);
+    fill(this.el.rsNext, this._ribSpans[g + 1]);
   }
 
   // index of the current speed in presets; snaps to nearest if it isn't one
@@ -265,6 +453,8 @@ export class ReadAlong {
   /* ---- rendering ---- */
   _renderReader(html) {
     const pane = this.el.pane;
+    this._ribbonJobId = null;                      // new job → stale ribbon
+    if (this.opts.focus && this.focusOn) this._buildRibbon();
     if (html) { pane.innerHTML = html; return; }
     pane.innerHTML = "";
     for (const ch of this.job.chunks) {
@@ -288,7 +478,8 @@ export class ReadAlong {
     if (el && el !== this._curWord) {
       if (this._curWord) this._curWord.classList.remove("cur");
       el.classList.add("cur");
-      el.scrollIntoView({ block: "center", behavior: "smooth" });
+      // in focus mode the pane is hidden — the ribbon handles motion
+      if (!this.focusOn) el.scrollIntoView({ block: "center", behavior: "smooth" });
       this._curWord = el;
     }
   }
@@ -362,6 +553,7 @@ export class ReadAlong {
     this.el.scrub.value = 0;
     this.el.time.textContent = `0:00 / ${fmt(this.job ? this.totalKnown() : 0)}`;
     this.el.pane.querySelectorAll(".w.cur").forEach(e => e.classList.remove("cur"));
+    if (this._curRibbonWord) { this._curRibbonWord.classList.remove("cur"); this._curRibbonWord = null; }
   }
 
   /* ---- speak ---- */
@@ -427,6 +619,7 @@ export class ReadAlong {
 
   destroy() {
     this.stop();
+    this._stopRibbon();
     this.audio.onplay = this.audio.onpause = this.audio.onended = this.audio.ontimeupdate = null;
     this.root.innerHTML = "";
   }

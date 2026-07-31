@@ -264,6 +264,7 @@ PAGE = r"""<!DOCTYPE html>
   .toast.show { opacity:1; }
 
   /* read-along player (shared ReadAlong module) */
+  .hidden { display:none !important; }
   .player { margin-top:.2rem; }
   .ra-pane { font-size:1rem; line-height:1.9; }
   .ra-pane .w { padding:0 1px; border-radius:3px; cursor:pointer; }
@@ -291,6 +292,28 @@ PAGE = r"""<!DOCTYPE html>
   .ra-controls .speeds button { flex:0 0 auto; padding:.25rem .5rem; font-size:.78rem; }
   .ra-controls .speeds button.active { background:var(--acc2); border-color:var(--acc2); color:#fff; }
   .ra-controls .spacer { flex:1; }
+  .ra-controls button.active { background:var(--acc2); border-color:var(--acc2); color:#fff; }
+  /* focus mode — fixed-gaze view (Bump: word-stepped ribbon; Still: RSVP swap) */
+  .ra-focus-win { position:relative; overflow:hidden; height:26vh; min-height:110px;
+                  background:var(--panel2); border:1px solid var(--line); border-radius:.6rem;
+                  -webkit-mask-image:linear-gradient(90deg, transparent 0, #000 15%, #000 85%, transparent 100%);
+                  mask-image:linear-gradient(90deg, transparent 0, #000 15%, #000 85%, transparent 100%); }
+  .ra-focus-win::before { content:""; position:absolute; left:50%; top:12%; bottom:12%;
+                          width:2px; margin-left:-1px; background:rgba(242,181,59,.16); }
+  .ra-ribbon { position:absolute; left:0; top:0; height:100%; display:flex; align-items:center;
+               white-space:nowrap; will-change:transform;
+               font-size:clamp(20px, 5.5vw, 28px); line-height:1.4;
+               transition:transform 0ms cubic-bezier(.22,.61,.36,1); }
+  .ra-ribbon .w { color:var(--mut); padding:3px 4px; border-radius:6px; }
+  .ra-ribbon .w.cur { background:var(--acc); color:#14161a; }
+  .ra-rsvp { position:absolute; inset:0; display:grid; grid-template-columns:1fr auto 1fr;
+             align-items:center; column-gap:18px;
+             font-size:clamp(22px, 6.5vw, 32px); line-height:1.4; }
+  .ra-rsvp .w { border-radius:6px; padding:2px 8px; }
+  .ra-rsvp .rs-prev, .ra-rsvp .rs-next { color:#565c64; font-size:.72em; }
+  .ra-rsvp .rs-prev { justify-self:end; }
+  .ra-rsvp .rs-next { justify-self:start; }
+  .ra-rsvp .rs-cur { background:var(--acc); color:#14161a; font-weight:500; }
 </style>
 <script type="module" src="/web/batspeaker-player.js"></script>
 </head>

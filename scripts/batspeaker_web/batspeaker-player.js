@@ -144,6 +144,9 @@ window.mountReadAlong = function (root, opts) {
     prepare: t => (opts.whole ? prepareOne(t) : prepareChunked(t)),
     getMd: () => false,
     compact: true,          // phone-first: one control line + speed stepper
+    focus: true,            // fixed-gaze focus mode (◎; Bump / Still styles)
+    focusKey: "batspeaker.focus",
+    focusStyleKey: "batspeaker.focusStyle",
     speedKey: "batspeaker.speed",
     defaultSpeed: 1.5,
     // The player emits "done" from onended when the last chunk finishes — use
