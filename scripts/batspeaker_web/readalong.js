@@ -1,3 +1,8 @@
+// SHARED FILE — byte-identical in two homes, synced by script (not yet a real
+// import; see the consolidation pickup note). Canonical: batcave-private repo
+// reader/readalong.js. Synced copy: batcave repo scripts/batspeaker_web/.
+// Edit HERE, then run batcave's scripts/batspeaker_web/sync_player.sh.
+//
 // ReadAlong — the multi-instance-safe read-along player (2026-07-03 refactor).
 //
 // Extracted from the reader's app.js: the global timeline over N audio chunks,
@@ -22,7 +27,7 @@
 
 import { silence, fmt } from "./audioutil.js";
 
-const DEFAULT_PRESETS = [1, 1.25, 1.5, 1.75, 2, 2.5, 2.75, 3];
+const DEFAULT_PRESETS = [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3];
 
 // Focus-mode view: shared by both control variants. The ribbon (bump style)
 // and the rsvp trio (still style) live side by side; the active style shows one.
@@ -114,7 +119,7 @@ export class ReadAlong {
     this.focusKey = opts.focusKey || "reader.focus";
     this.focusOn = !!opts.focus && localStorage.getItem(this.focusKey) === "1";
     this.focusStyleKey = opts.focusStyleKey || "reader.focusStyle";
-    this.focusStyle = localStorage.getItem(this.focusStyleKey) === "still" ? "still" : "bump";
+    this.focusStyle = localStorage.getItem(this.focusStyleKey) === "bump" ? "bump" : "still";
     this._rsvpG = -1;          // flat word index currently shown by the still style
     this._raf = 0;             // rAF handle for the ribbon loop
     this._ribX = null;         // ribbon rest position (px into the line)
@@ -232,9 +237,9 @@ export class ReadAlong {
   }
 
   // Two focus styles, switchable mid-playback for side-by-side feel:
-  //   bump  — the ribbon line slides one word at a time (default)
   //   still — RSVP: the word swaps in place at the focal point, zero motion,
-  //           dimmed prev/next neighbors for context
+  //           dimmed prev/next neighbors for context (default)
+  //   bump  — the ribbon line slides one word at a time
   toggleFocusStyle() {
     this.focusStyle = this.focusStyle === "still" ? "bump" : "still";
     localStorage.setItem(this.focusStyleKey, this.focusStyle);

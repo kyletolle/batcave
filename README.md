@@ -15,6 +15,10 @@ The workflow behind every tool here follows the same arc:
 3. **Bruce implements.** I review behavior, not diffs, on the first pass. Tests come along where the logic warrants them (see `scripts/tests/`).
 4. **Lessons get encoded, not just remembered.** When something goes wrong, the fix becomes structure: the Todoist CLI logs every mutation to an audit trail because we once needed one and didn't have it. Mutations are forbidden outside that CLI because raw API calls bypass the log. The guardrails in this code are scar tissue from real incidents.
 
+## The incubator
+
+Not everything lands here first. New tools start life in `batcave-private`, a private sibling repo that works as the test bed: rough edges, personal data paths, and half-formed experiments live there while a tool proves it's worth keeping. Promotion to this repo is a deliberate copy-commit after a tool has earned its place and passed a privacy review. Some things never graduate (anything wired too tightly to personal data stays private for good). What you see here is the survivors — if the toolbox looks curated, that's because it is.
+
 ## What's here
 
 ### `bin/` — command wrappers
