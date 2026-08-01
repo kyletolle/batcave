@@ -23,6 +23,12 @@ Endpoints:
     GET  /config / POST /config  voice/engine/speed; per-session listen toggles
     GET  /silence.mp3            silent prime that unlocks iOS autoplay
     POST /restart                restart the systemd unit (pick up code edits)
+
+Every URL the page itself uses (fetches, script src, audio) is relative, so the
+app works both at the origin root and behind a stripping path mount (e.g. a
+tailscale-serve /batspeaker route in front of the staging hub). The server
+never needs to know its mount point; the page bounces itself to a trailing
+slash once so relative URLs resolve under the mount.
 """
 import os, re, json, time, socket, argparse, tempfile, subprocess, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -127,7 +133,7 @@ def turn_payload(turn, with_html=True):
         "ts": turn.get("ts"),
         "user": core.caption(turn.get("user", ""), 200),
         "has_audio": has_audio,
-        "audio_url": f"/audio/{turn['id']}.mp3" if has_audio else None,
+        "audio_url": f"audio/{turn['id']}.mp3" if has_audio else None,
     }
     if with_html:
         p["html"] = core.md_to_html(core.turn_full_md(turn))
@@ -315,7 +321,13 @@ PAGE = r"""<!DOCTYPE html>
   .ra-rsvp .rs-next { justify-self:start; }
   .ra-rsvp .rs-cur { background:var(--acc); color:#14161a; font-weight:500; }
 </style>
-<script type="module" src="/web/batspeaker-player.js"></script>
+<script>
+  // Path-mounted deployments (…/batspeaker) need the trailing slash so the
+  // page's relative URLs resolve inside the mount; bounce once if it's missing.
+  if(!location.pathname.endsWith("/"))
+    location.replace(location.pathname + "/" + location.search + location.hash);
+</script>
+<script type="module" src="./web/batspeaker-player.js"></script>
 </head>
 <body>
 <header>
@@ -384,7 +396,7 @@ function fmtTime(ts){ if(!ts) return ""; const d=new Date(ts);
   return isNaN(d)?"":d.toLocaleString([], {month:"short",day:"numeric",hour:"numeric",minute:"2-digit"}); }
 
 async function loadSessions(){
-  const r = await fetch("/sessions"); sessions = await r.json();
+  const r = await fetch("./sessions"); sessions = await r.json();
   renderTabs();
   if(!active && sessions.length){ selectSession(sessions[0].id); }
 }
@@ -409,7 +421,7 @@ async function selectSession(id){
   renderTabs();
   seen.clear();
   const thread = $("#thread"); thread.innerHTML = `<div class="empty">Loading…</div>`;
-  const r = await fetch(`/session?id=${id}&n=20`);
+  const r = await fetch(`./session?id=${id}&n=20`);
   if(!r.ok){ thread.innerHTML = `<div class="empty">Couldn't load.</div>`; return; }
   const turns = await r.json();
   thread.innerHTML = "";
@@ -464,7 +476,7 @@ function mountPlayer(card, {onDone=null}={}){
 
 function openStream(id){
   if(es){ es.close(); es=null; }
-  es = new EventSource(`/events?session=${id}`);
+  es = new EventSource(`./events?session=${id}`);
   es.onmessage = ev => {
     let t; try{ t = JSON.parse(ev.data); }catch{ return; }
     if(active!==id) return;
@@ -505,7 +517,7 @@ function pump(){
 
 // ---- iOS autoplay unlock ----
 $("#startBtn").onclick = async () => {
-  try{ unlockEl.src="/silence.mp3"; await unlockEl.play(); audioUnlocked=true;
+  try{ unlockEl.src="./silence.mp3"; await unlockEl.play(); audioUnlocked=true;
        $("#startBtn").textContent="🔈 On"; toast("Audio unlocked"); }
   catch(e){ toast("Tap again to unlock audio"); }
 };
@@ -514,7 +526,7 @@ $("#startBtn").onclick = async () => {
 $("#listenToggle").onchange = async e => {
   if(!active) return;
   const on = e.target.checked;
-  await fetch("/config", {method:"POST", headers:{"Content-Type":"application/json"},
+  await fetch("./config", {method:"POST", headers:{"Content-Type":"application/json"},
     body: JSON.stringify({listen:{session:active, on}})});
   const s = sessions.find(x=>x.id===active); if(s) s.listening = on;
   renderTabs();
@@ -528,7 +540,7 @@ function fillVoices(sel, voices, current){
     if(v===current) o.selected=true; sel.appendChild(o); });
 }
 async function loadConfig(){
-  const r = await fetch("/config"); const c = await r.json();
+  const r = await fetch("./config"); const c = await r.json();
   fillVoices($("#cfgVoice"), c.voices, c.voice);
   fillVoices($("#cfgUnrealVoice"), c.unreal_voices, c.unreal_voice);
   fillVoices($("#cfgInworldVoice"), c.inworld_voices, c.inworld_voice);
@@ -538,7 +550,7 @@ async function loadConfig(){
 $("#menuBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
 $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
 $("#cfgSave").onclick = async ()=>{
-  await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},
+  await fetch("./config",{method:"POST",headers:{"Content-Type":"application/json"},
     body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
                           unreal_voice:$("#cfgUnrealVoice").value,
                           inworld_voice:$("#cfgInworldVoice").value,
@@ -546,7 +558,7 @@ $("#cfgSave").onclick = async ()=>{
   toast("Saved"); $("#panel").classList.remove("open");
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
-  await fetch("/restart",{method:"POST"}); setTimeout(()=>location.reload(),4000); };
+  await fetch("./restart",{method:"POST"}); setTimeout(()=>location.reload(),4000); };
 $("#reloadBtn").onclick = ()=>{ loadSessions(); $("#panel").classList.remove("open"); };
 
 function escapeHtml(s){ return (s||"").replace(/[&<>"]/g, c=>(
@@ -704,7 +716,9 @@ class Handler(BaseHTTPRequestHandler):
             _, dur = core.synth_turn(turn_id, text)
         except Exception as ex:
             return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
-        resp = {"url": f"/audio/{turn_id}.mp3", "duration": dur}
+        # Relative on purpose: the client resolves it against the page URL, so
+        # it works at / and under a path mount alike.
+        resp = {"url": f"audio/{turn_id}.mp3", "duration": dur}
         words = core.load_words(turn_id)   # per-word timestamps, if the engine has them
         if words:
             resp["words"] = words
@@ -728,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
             path, dur, words = core.synth_turn_chunk(turn_id, i, text)
         except Exception as ex:
             return self._json(500, {"error": f"tts failed: {repr(ex)[:160]}"})
-        resp = {"url": f"/audio/{os.path.basename(path)}", "duration": dur}
+        resp = {"url": f"audio/{os.path.basename(path)}", "duration": dur}
         if words:
             resp["words"] = words
         return self._json(200, resp)

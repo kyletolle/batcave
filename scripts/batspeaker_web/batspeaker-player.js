@@ -80,7 +80,9 @@ class BatSpeakerSource {
   cancel() { this.job = null; }
 
   async _post(body) {
-    const r = await fetch("/tts", {
+    // Relative: fetch resolves against the document base URL (not this module's
+    // /web/ path), so the call lands on the same mount the page was served from.
+    const r = await fetch("./tts", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
