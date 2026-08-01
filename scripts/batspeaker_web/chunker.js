@@ -1,5 +1,5 @@
 // SHARED FILE — byte-identical in two homes, synced by script. Canonical:
-// kyletolle.com repo reader/chunker.js; synced copy: batcave repo
+// batcave-private repo reader/chunker.js; synced copy: batcave repo
 // scripts/batspeaker_web/. Edit HERE, then run sync_player.sh there.
 //
 // Port of local-tts chunker.py — split text into speak-sized chunks on

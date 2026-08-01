@@ -1,5 +1,5 @@
 // SHARED FILE — byte-identical in two homes, synced by script (not yet a real
-// import; see the consolidation pickup note). Canonical: kyletolle.com repo
+// import; see the consolidation pickup note). Canonical: batcave-private repo
 // reader/readalong.js. Synced copy: batcave repo scripts/batspeaker_web/.
 // Edit HERE, then run batcave's scripts/batspeaker_web/sync_player.sh.
 //
@@ -27,7 +27,7 @@
 
 import { silence, fmt } from "./audioutil.js";
 
-const DEFAULT_PRESETS = [1, 1.25, 1.5, 1.75, 2, 2.5, 2.75, 3];
+const DEFAULT_PRESETS = [1, 1.25, 1.5, 1.75, 2, 2.25, 2.5, 2.75, 3];
 
 // Focus-mode view: shared by both control variants. The ribbon (bump style)
 // and the rsvp trio (still style) live side by side; the active style shows one.

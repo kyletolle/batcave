@@ -1,7 +1,7 @@
 """The shared ReadAlong player files must not drift from their canonical home.
 
 readalong.js / audioutil.js / chunker.js in batspeaker_web/ are byte-identical
-synced copies of the reader's files (kyletolle.com repo). Until Bat-Speaker
+synced copies of the reader's files (batcave-private repo). Until Bat-Speaker
 gains a build step and imports a true shared package, sync_player.sh --check
 is the drift alarm; this test wires it into the suite.
 
@@ -17,7 +17,7 @@ import pytest
 HERE = Path(__file__).resolve().parent
 SYNC = HERE.parent / "batspeaker_web" / "sync_player.sh"
 READER_SRC = Path(
-    os.environ.get("READER_SRC", Path.home() / "projects" / "kyletolle.com" / "reader")
+    os.environ.get("READER_SRC", Path.home() / "projects" / "batcave-private" / "reader")
 )
 
 

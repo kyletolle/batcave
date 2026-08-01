@@ -9,7 +9,7 @@
 # modules, no build step). Until Bat-Speaker gains a build step and a true
 # shared import, THIS script is the consolidation mechanism:
 #
-#   canonical:  <kyletolle.com repo>/reader/{readalong,audioutil,chunker}.js
+#   canonical:  <batcave-private repo>/reader/{readalong,audioutil,chunker}.js
 #   synced:     this directory
 #
 # Edit the reader copy, then run this. test_player_sync.py fails the batcave
@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-READER_SRC="${READER_SRC:-$HOME/projects/kyletolle.com/reader}"
+READER_SRC="${READER_SRC:-$HOME/projects/batcave-private/reader}"
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 FILES=(readalong.js audioutil.js chunker.js)
 

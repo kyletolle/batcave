@@ -7,7 +7,7 @@ code keeps running otherwise.
 ## Shared player files (synced copies, not sources)
 
 `readalong.js`, `audioutil.js`, and `chunker.js` are **byte-identical synced
-copies** of the canonical files in the kyletolle.com repo (`reader/`). One
+copies** of the canonical files in the batcave-private repo (`reader/`). One
 player codebase, two packaging worlds: the reader bundles with esbuild, this
 app serves raw modules, so until Bat-Speaker gains a build step the files are
 mirrored rather than imported.

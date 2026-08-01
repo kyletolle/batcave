@@ -1,5 +1,5 @@
 // SHARED FILE — byte-identical in two homes, synced by script. Canonical:
-// kyletolle.com repo reader/audioutil.js; synced copy: batcave repo
+// batcave-private repo reader/audioutil.js; synced copy: batcave repo
 // scripts/batspeaker_web/. Edit HERE, then run sync_player.sh there.
 //
 // Shared audio helpers, used by both the ReadAlong player and its synth sources.
