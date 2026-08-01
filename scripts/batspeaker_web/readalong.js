@@ -1,3 +1,8 @@
+// SHARED FILE — byte-identical in two homes, synced by script (not yet a real
+// import; see the consolidation pickup note). Canonical: kyletolle.com repo
+// reader/readalong.js. Synced copy: batcave repo scripts/batspeaker_web/.
+// Edit HERE, then run batcave's scripts/batspeaker_web/sync_player.sh.
+//
 // ReadAlong — the multi-instance-safe read-along player (2026-07-03 refactor).
 //
 // Extracted from the reader's app.js: the global timeline over N audio chunks,
