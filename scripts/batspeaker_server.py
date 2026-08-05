@@ -201,6 +201,11 @@ PAGE = r"""<!DOCTYPE html>
   :root { --bg:#0f1115; --panel:#171a21; --panel2:#1f232c; --fg:#e7e9ee;
           --mut:#8b93a3; --acc:#f2b53b; --acc2:#3b82f6; --line:#272c36; }
   * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  /* iOS Safari "font boosting" inflates body text inside wide blocks — in
+     landscape the 760px card tripped it, so prose rendered far larger than the
+     chrome around it while headers and tabs stayed put. 100% means "respect the
+     size I specified"; unlike `none` it leaves pinch-zoom alone. */
+  html { -webkit-text-size-adjust:100%; text-size-adjust:100%; }
   html,body { margin:0; height:100%; }
   body { background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,
          BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
