@@ -248,6 +248,28 @@ PAGE = r"""<!DOCTYPE html>
   .turn .body th,.turn .body td { border:1px solid var(--line); padding:.35rem .55rem;
                                   text-align:left; vertical-align:top; }
   .turn .body th { background:#0b0d11; font-weight:600; }
+  /* Landscape on a phone: the app's own chrome (header + tab strip + the sticky
+     Speak row) ate 157px of a 306px viewport — 51% — leaving about four lines to
+     read in. Tightening it lands at 116px (38%), so the reading area goes 149px
+     -> 190px, about +28%. Nothing is removed and everything stays reachable;
+     only the timestamp hides. Landscape stays cramped by simple arithmetic —
+     going further means chrome that auto-hides on scroll, not smaller padding. */
+  @media (max-height: 500px) {
+    header { padding:.2rem .6rem; padding-top:max(.2rem, env(safe-area-inset-top)); }
+    header .title { font-size:.95rem; }
+    header .sub { display:none; }
+    #tabs { padding:.25rem .5rem; gap:.3rem; }
+    .tab { padding:.15rem .5rem; font-size:.8rem; }
+    .tab .cnt { font-size:.7rem; }
+    #thread { padding:.4rem .5rem max(.4rem, env(safe-area-inset-bottom)); }
+    .turn { padding:.45rem .6rem; margin-bottom:.5rem; }
+    .turn .q { margin-bottom:.35rem; font-size:.8rem; }
+    .turn > .row { margin-top:.35rem; padding-top:.3rem; padding-bottom:.1rem; }
+    .turn > .row .sub { display:none; }   /* the timestamp is the first thing to go */
+    button { padding:.2rem .5rem; }
+    .icon { padding:.15rem .45rem; }      /* class beats the bare `button` rule */
+    .speak { font-size:.8rem; }
+  }
   .row { display:flex; align-items:center; gap:.6rem; margin-top:.6rem; }
   /* The card's own control row sticks to the bottom of the screen so Speak is
      always reachable while scrolling a long turn (matches the sticky transport). */
