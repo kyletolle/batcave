@@ -340,10 +340,81 @@ def _inline(s):
     return s
 
 
+_TBL_DELIM_CELL = re.compile(r"^:?-+:?$")
+
+
+def _split_table_row(line):
+    """Split a pipe-table row into trimmed cells, honouring escaped pipes and the
+    optional leading/trailing pipe."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|") and not s.endswith("\\|"):
+        s = s[:-1]
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
+
+
+def _table_alignments(line):
+    """Column alignments from a delimiter row (`|---|--:|`), or None if the line
+    isn't one."""
+    aligns = []
+    for cell in _split_table_row(line):
+        cell = cell.replace(" ", "")
+        if not _TBL_DELIM_CELL.match(cell):
+            return None
+        if cell.startswith(":") and cell.endswith(":"):
+            aligns.append("center")
+        elif cell.endswith(":"):
+            aligns.append("right")
+        elif cell.startswith(":"):
+            aligns.append("left")
+        else:
+            aligns.append(None)
+    return aligns
+
+
+def _table_at(lines, i):
+    """(header cells, alignments) if a GFM pipe table starts at line i, else None.
+    Requiring a pipe in the header and a matching column count keeps a plain
+    `---` rule under a paragraph from reading as a one-column table."""
+    if i + 1 >= len(lines) or "|" not in lines[i]:
+        return None
+    header = _split_table_row(lines[i])
+    aligns = _table_alignments(lines[i + 1])
+    if aligns is None or len(aligns) != len(header):
+        return None
+    return header, aligns
+
+
+def _table_cell(tag, text, align):
+    style = f' style="text-align:{align}"' if align else ""
+    return f"<{tag}{style}>{_inline(text)}</{tag}>"
+
+
+def _render_table(lines, i):
+    """Render the pipe table starting at line i. Returns (html, next index)."""
+    header, aligns = _table_at(lines, i)
+    ncol = len(header)
+    i += 2
+    body = []
+    while i < len(lines) and lines[i].strip() and "|" in lines[i]:
+        # GFM pads short rows and drops the overflow from long ones.
+        cells = (_split_table_row(lines[i]) + [""] * ncol)[:ncol]
+        body.append("<tr>" + "".join(_table_cell("td", c, a)
+                                     for c, a in zip(cells, aligns)) + "</tr>")
+        i += 1
+    head = "<tr>" + "".join(_table_cell("th", c, a)
+                            for c, a in zip(header, aligns)) + "</tr>"
+    out = ('<div class="tbl-wrap"><table><thead>' + head + "</thead>"
+           + ("<tbody>" + "".join(body) + "</tbody>" if body else "")
+           + "</table></div>")
+    return out, i
+
+
 def md_to_html(md):
     """Modest markdown renderer: paragraphs, headings, fenced code, blockquotes,
-    bullet/numbered lists, and inline emphasis/code/links. Enough to read Bruce's
-    prose comfortably; not a spec-complete converter."""
+    bullet/numbered lists, pipe tables, and inline emphasis/code/links. Enough to
+    read Bruce's prose comfortably; not a spec-complete converter."""
     out = []
     lines = md.split("\n")
     i = 0
@@ -367,6 +438,12 @@ def md_to_html(md):
             lvl = len(m.group(1))
             out.append(f"<h{lvl}>{_inline(m.group(2).strip())}</h{lvl}>")
             i += 1
+            continue
+        # pipe table — must precede the paragraph fallback, which would otherwise
+        # glue the rows into one unreadable line of pipes and dashes.
+        if _table_at(lines, i):
+            block, i = _render_table(lines, i)
+            out.append(block)
             continue
         # horizontal rule
         if re.match(r"^\s*[-*_]{3,}\s*$", line):
@@ -404,7 +481,7 @@ def md_to_html(md):
         # paragraph (gather until blank or block start)
         para = [line]
         i += 1
-        while i < n and lines[i].strip() and not re.match(
+        while i < n and lines[i].strip() and not _table_at(lines, i) and not re.match(
                 r"^\s*(```|#{1,6}\s|>\s?|[-*+]\s|\d+\.\s|[-*_]{3,}\s*$)", lines[i]):
             para.append(lines[i])
             i += 1

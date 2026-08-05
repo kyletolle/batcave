@@ -241,6 +241,13 @@ PAGE = r"""<!DOCTYPE html>
   .turn .body blockquote { color:var(--mut); border-left:3px solid var(--line);
                            margin:.5rem 0; padding-left:.7rem; }
   .turn .body h1,.turn .body h2,.turn .body h3 { font-size:1.05rem; margin:.7rem 0 .35rem; }
+  /* tables — the wrapper scrolls sideways on a phone instead of widening the card.
+     Column alignment arrives as an inline style from the markdown, which wins. */
+  .turn .body .tbl-wrap { overflow-x:auto; margin:.6rem 0; -webkit-overflow-scrolling:touch; }
+  .turn .body table { border-collapse:collapse; font-size:.85rem; line-height:1.45; }
+  .turn .body th,.turn .body td { border:1px solid var(--line); padding:.35rem .55rem;
+                                  text-align:left; vertical-align:top; }
+  .turn .body th { background:#0b0d11; font-weight:600; }
   .row { display:flex; align-items:center; gap:.6rem; margin-top:.6rem; }
   /* The card's own control row sticks to the bottom of the screen so Speak is
      always reachable while scrolling a long turn (matches the sticky transport). */
