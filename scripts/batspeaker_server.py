@@ -210,26 +210,32 @@ PAGE = r"""<!DOCTYPE html>
   body { background:var(--bg); color:var(--fg); font:16px/1.55 -apple-system,
          BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
          display:flex; flex-direction:column; }
-  header { display:flex; align-items:center; gap:.5rem; padding:.55rem .7rem;
+  header { display:flex; align-items:center; gap:.4rem; padding:.3rem .5rem;
            background:var(--panel); border-bottom:1px solid var(--line);
-           padding-top:max(.55rem, env(safe-area-inset-top)); }
-  header .title { font-weight:700; color:var(--acc); letter-spacing:.2px; }
-  header .sp { flex:1; }
-  header .dot { font-size:.7rem; color:#888; }
+           padding-top:max(.3rem, env(safe-area-inset-top)); }
+  /* The app name and vault moved in here, so the bar itself carries no text. */
+  #panel .brand { display:flex; align-items:baseline; gap:.5rem; margin-bottom:.2rem; }
+  #panel .brand .title { font-weight:700; color:var(--acc); letter-spacing:.2px; }
   button { font:inherit; color:var(--fg); background:var(--panel2);
            border:1px solid var(--line); border-radius:.5rem; padding:.35rem .6rem;
            cursor:pointer; }
   button:active { transform:translateY(1px); }
   .icon { padding:.35rem .5rem; }
-  #tabs { display:flex; gap:.4rem; overflow-x:auto; padding:.5rem .6rem;
-          background:var(--panel); border-bottom:1px solid var(--line);
-          scrollbar-width:none; }
+  /* Connection state, formerly its own dot: accent when the stream is live,
+     muted when it drops. Flex-shrink:0 keeps it pinned right of the scroller. */
+  #menuBtn { flex:0 0 auto; color:var(--mut); border-color:var(--line); }
+  #menuBtn.live { color:var(--acc); border-color:var(--acc); }
+  /* The scroller takes the rest of the bar. min-width:0 is what actually lets a
+     flex child shrink below its content and scroll instead of shoving the menu
+     button off-screen. */
+  #tabs { flex:1 1 auto; min-width:0; display:flex; gap:.35rem; overflow-x:auto;
+          padding:.1rem 0; scrollbar-width:none; }
   #tabs::-webkit-scrollbar { display:none; }
-  .tab { flex:0 0 auto; max-width:62vw; padding:.4rem .6rem; border-radius:.6rem;
+  .tab { flex:0 0 auto; max-width:62vw; padding:.25rem .5rem; border-radius:.5rem;
          background:var(--panel2); border:1px solid var(--line); color:var(--fg);
-         white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:.9rem; }
+         white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:12px; }
   .tab.active { border-color:var(--acc); color:var(--acc); }
-  .tab .cnt { color:var(--mut); font-size:.78rem; margin-left:.35rem; }
+  .tab .cnt { color:var(--mut); font-size:10px; margin-left:.3rem; }
   .tab .ear { margin-left:.3rem; }
   #thread { flex:1; overflow-y:auto;
             padding:.7rem .7rem max(.9rem, env(safe-area-inset-bottom));
@@ -253,19 +259,16 @@ PAGE = r"""<!DOCTYPE html>
   .turn .body th,.turn .body td { border:1px solid var(--line); padding:.35rem .55rem;
                                   text-align:left; vertical-align:top; }
   .turn .body th { background:#0b0d11; font-weight:600; }
-  /* Landscape on a phone: the app's own chrome (header + tab strip + the sticky
-     Speak row) ate 157px of a 306px viewport — 51% — leaving about four lines to
-     read in. Tightening it lands at 116px (38%), so the reading area goes 149px
-     -> 190px, about +28%. Nothing is removed and everything stays reachable;
-     only the timestamp hides. Landscape stays cramped by simple arithmetic —
-     going further means chrome that auto-hides on scroll, not smaller padding. */
+  /* Landscape on a phone started at 157px of chrome on a 306px viewport — 51%,
+     about four lines to read in. Merging the two bars into one did most of the
+     work; this trims what's left. Final: 79px (26%), so the reading area went
+     149px -> 227px, about +52%. Nothing is unreachable — only the timestamp
+     beside Speak hides. */
   @media (max-height: 500px) {
-    header { padding:.2rem .6rem; padding-top:max(.2rem, env(safe-area-inset-top)); }
-    header .title { font-size:.95rem; }
-    header .sub { display:none; }
-    #tabs { padding:.25rem .5rem; gap:.3rem; }
-    .tab { padding:.15rem .5rem; font-size:.8rem; }
-    .tab .cnt { font-size:.7rem; }
+    header { padding:.15rem .5rem; padding-top:max(.15rem, env(safe-area-inset-top)); }
+    #tabs { gap:.3rem; }
+    .tab { padding:.1rem .45rem; font-size:11px; }
+    .tab .cnt { font-size:9px; }
     #thread { padding:.4rem .5rem max(.4rem, env(safe-area-inset-bottom)); }
     .turn { padding:.45rem .6rem; margin-bottom:.5rem; }
     .turn .q { margin-bottom:.35rem; font-size:.8rem; }
@@ -364,17 +367,19 @@ PAGE = r"""<!DOCTYPE html>
 <script type="module" src="./web/batspeaker-player.js"></script>
 </head>
 <body>
+<!-- One bar, not two: the tab strip scrolls in the header itself. The app name
+     and vault live under the menu, and the menu button IS the connection lamp
+     (accent = live, muted = dropped) — a dot of its own was a whole extra
+     element for one bit of state. -->
 <header>
-  <span class="title">🔊 Bat-Speaker</span>
-  <span class="sub" id="now"></span>
-  <span class="sp"></span>
-  <span class="dot" id="liveDot" title="Live connection">●</span>
+  <div id="tabs"></div>
   <button class="icon" id="menuBtn" title="Menu">☰</button>
 </header>
-<div id="tabs"></div>
 <div id="thread"><div class="empty">Pick a conversation above.</div></div>
 
 <div id="panel"><div class="card">
+  <div class="brand"><span class="title">🔊 Bat-Speaker</span><span class="sub" id="now"></span></div>
+
   <div class="sect">Audio</div>
   <button id="startBtn" title="Unlock audio">▶︎ Listen (unlock audio)</button>
   <label class="switch" style="margin-top:.7rem;">
@@ -534,8 +539,9 @@ function openStream(id){
     if(atBottom) thread.scrollTop = thread.scrollHeight;
     if(t.audio_url){ enqueue(card); }   // listen mode: server pre-synthed it
   };
-  es.onerror = () => { $("#liveDot").style.color="#888"; };
-  es.onopen = () => { $("#liveDot").style.color="var(--acc)"; };
+  // The menu button doubles as the connection lamp — see the header comment.
+  es.onerror = () => { $("#menuBtn").classList.remove("live"); };
+  es.onopen = () => { $("#menuBtn").classList.add("live"); };
 }
 
 function enqueue(card){
