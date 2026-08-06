@@ -237,13 +237,22 @@ PAGE = r"""<!DOCTYPE html>
   .tab.active { border-color:var(--acc); color:var(--acc); }
   .tab .cnt { color:var(--mut); font-size:10px; margin-left:.3rem; }
   .tab .ear { margin-left:.3rem; }
-  #thread { flex:1; overflow-y:auto;
-            padding:.7rem .7rem max(.9rem, env(safe-area-inset-bottom));
+  /* No bottom padding here on purpose: a sticky child cannot reach into its
+     scroll container's bottom padding, so the safe-area inset became a band
+     below the Speak button where text showed through. The inset lives on the
+     button's own row instead, which is what actually needs to clear the home
+     indicator. */
+  #thread { flex:1; overflow-y:auto; padding:.7rem .7rem 0;
             -webkit-overflow-scrolling:touch; }
   .turn { background:var(--panel); border:1px solid var(--line);
           border-radius:.7rem; padding:.7rem .8rem; margin:0 auto .8rem; max-width:760px; }
+  /* The timestamp lives up here now — it used to ride the Speak row, which is a
+     floating button and has no room for a passenger. */
   .turn .q { color:var(--mut); font-size:.86rem; border-left:2px solid var(--line);
-             padding-left:.55rem; margin-bottom:.55rem; white-space:pre-wrap; }
+             padding-left:.55rem; margin-bottom:.55rem;
+             display:flex; align-items:baseline; gap:.6rem; }
+  .turn .q .qt { flex:1; min-width:0; white-space:pre-wrap; }
+  .turn .q .ts { flex:0 0 auto; font-size:.72rem; opacity:.8; }
   .turn .body p:first-child { margin-top:0; }
   .turn .body p:last-child { margin-bottom:0; }
   .turn .body pre { background:#0b0d11; border:1px solid var(--line);
@@ -269,22 +278,33 @@ PAGE = r"""<!DOCTYPE html>
     #tabs { gap:.3rem; }
     .tab { padding:.1rem .45rem; font-size:11px; }
     .tab .cnt { font-size:9px; }
-    #thread { padding:.4rem .5rem max(.4rem, env(safe-area-inset-bottom)); }
+    #thread { padding:.4rem .5rem 0; }
     .turn { padding:.45rem .6rem; margin-bottom:.5rem; }
     .turn .q { margin-bottom:.35rem; font-size:.8rem; }
-    .turn > .row { margin-top:.35rem; padding-top:.3rem; padding-bottom:.1rem; }
-    .turn > .row .sub { display:none; }   /* the timestamp is the first thing to go */
+    .turn > .row { margin-top:.25rem; padding-top:.15rem;
+                   padding-bottom:max(.2rem, env(safe-area-inset-bottom)); }
     button { padding:.2rem .5rem; }
     .icon { padding:.15rem .45rem; }      /* class beats the bare `button` rule */
     .speak { font-size:.8rem; }
   }
   .row { display:flex; align-items:center; gap:.6rem; margin-top:.6rem; }
-  /* The card's own control row sticks to the bottom of the screen so Speak is
-     always reachable while scrolling a long turn (matches the sticky transport). */
-  .turn > .row { position:sticky; bottom:0; z-index:2; background:var(--panel);
-                 border-top:1px solid var(--line); padding:.5rem 0 .2rem; margin-top:.5rem; }
+  /* Speak floats; it is not a bar. As a full-width strip with its own background
+     and rule it cut the text in half and left a band of half-read line beneath
+     it. Now only the button itself is visible — prose flows behind it, and taps
+     land on the text except on the button, which is the one thing that wants
+     them. It rides the bottom of the window, safe-area included. */
+  .turn > .row { position:sticky; bottom:0; z-index:2; pointer-events:none;
+                 padding:.2rem 0 max(.35rem, env(safe-area-inset-bottom));
+                 margin-top:.4rem; }
+  .turn > .row > * { pointer-events:auto; }
+  /* Right-hand side: a floating button covers whatever is under it, and lines
+     end ragged on the right while they all start flush on the left. Sitting
+     right hides a word far less often — and it's the thumb-reachable corner. */
+  .turn > .row .speak { margin-left:auto; }
   .row audio { flex:1; height:34px; }
-  .speak { font-size:.85rem; }
+  .speak { font-size:.85rem; background:var(--panel2); border:1px solid var(--line);
+           border-radius:1rem; padding:.3rem .8rem;
+           box-shadow:0 2px 12px rgba(0,0,0,.6); }
   .speak.busy { opacity:.5; }
   .sub { color:var(--mut); font-size:.78rem; }
   .switch { display:inline-flex; align-items:center; gap:.5rem; font-size:.95rem; }
@@ -292,11 +312,20 @@ PAGE = r"""<!DOCTYPE html>
   #panel .sect { color:var(--mut); font-size:.78rem; text-transform:uppercase;
                  letter-spacing:.4px; margin:1rem 0 .35rem; }
   #panel .sect:first-of-type { margin-top:.4rem; }
+  /* The sheet outgrew the screen. `align-items:flex-end` pinned it to the bottom
+     and pushed the overflow off the TOP, where nothing could scroll to it — the
+     Audio section was simply unreachable. Scrolling the overlay plus an auto top
+     margin fixes it: the margin still parks a short sheet at the bottom, but
+     collapses to 0 once the card is taller than the screen, so the top comes
+     back into reach. */
   #panel { position:fixed; inset:0; background:rgba(0,0,0,.5); display:none;
-           align-items:flex-end; z-index:20; }
+           z-index:20; overflow-y:auto; overscroll-behavior:contain;
+           -webkit-overflow-scrolling:touch; }
   #panel.open { display:flex; }
-  #panel .card { background:var(--panel); width:100%; max-width:760px; margin:0 auto;
-                 border-radius:.8rem .8rem 0 0; padding:1rem; border:1px solid var(--line); }
+  #panel .card { background:var(--panel); width:100%; max-width:760px;
+                 margin:auto auto 0;
+                 border-radius:.8rem .8rem 0 0; border:1px solid var(--line);
+                 padding:1rem 1rem max(1rem, env(safe-area-inset-bottom)); }
   #panel label { display:block; margin:.6rem 0 .2rem; color:var(--mut); font-size:.85rem; }
   #panel select, #panel input[type=number] { width:100%; padding:.45rem; background:var(--panel2);
        color:var(--fg); border:1px solid var(--line); border-radius:.45rem; }
@@ -481,12 +510,12 @@ function renderTurn(t){
   // read-along transport, itself sticky-bottom, so the control zone stays pinned
   // to the same place whether a turn is playing (transport) or idle (Speak).
   card.innerHTML =
-    (t.user ? `<div class="q">${escapeHtml(t.user)}</div>`:"") +
+    `<div class="q"><span class="qt">${t.user ? escapeHtml(t.user) : ""}</span>` +
+    `<span class="ts">${fmtTime(t.ts)}</span></div>` +
     `<div class="player"></div>` +
     `<div class="body">${t.html||""}</div>` +
     `<div class="row">
        <button class="speak">🔊 Speak</button>
-       <span class="sub">${fmtTime(t.ts)}</span>
        <span class="grow"></span>
      </div>`;
   card.querySelector(".speak").onclick = () => mountPlayer(card);
