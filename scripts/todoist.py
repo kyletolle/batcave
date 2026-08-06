@@ -17,7 +17,7 @@ Usage:
     todoist.py add-section NAME [--project NAME] Create a new section
     todoist.py move-section SECTION ID [ID ...]  Move task(s) to a section
     todoist.py reminders TASK_ID                 List reminders for a task
-    todoist.py add-reminder TASK_ID OFFSET [...] Add reminder(s) before due date
+    todoist.py add-reminder TASK_ID OFFSET [...] Add reminder(s) before due date (--urgent)
     todoist.py remove-reminder REMINDER_ID       Delete a reminder
     todoist.py add-project NAME [options]        Create a project (--color, --parent)
     todoist.py rename-project NAME NEW_NAME      Rename a project
@@ -1301,18 +1301,23 @@ def cmd_reminders(args):
     print()
     for r in sorted(task_reminders, key=lambda x: x.get("minute_offset", 0), reverse=True):
         rtype = r.get("type", "?")
+        urgent = "  [URGENT]" if r.get("is_urgent") else ""
         if rtype == "relative":
             offset = r.get("minute_offset", 0)
-            print(f"  {format_offset(offset)} before  (id: {r['id']})")
+            print(f"  {format_offset(offset)} before{urgent}  (id: {r['id']})")
         else:
             due = r.get("due", {})
-            print(f"  absolute: {due.get('date', '?')}  (id: {r['id']})")
+            print(f"  absolute: {due.get('date', '?')}{urgent}  (id: {r['id']})")
 
 
 def cmd_add_reminder(args):
     """Add one or more relative reminders to a task.
 
     Offsets: 30m, 1h, 1d, 3d, 7d, 1w, 2w, etc.
+
+    --urgent marks them as Todoist "urgent reminders": a full-screen alarm that
+    breaks through silent mode and Do Not Disturb. iOS 26+ only; other clients
+    fall back to a normal notification.
     """
     # Validate all offsets first
     parsed = []
@@ -1341,6 +1346,8 @@ def cmd_add_reminder(args):
             "type": "relative",
             "minute_offset": minutes,
         }
+        if args.urgent:
+            payload["is_urgent"] = True
         reminder = api_post("reminders", payload)
         log_mutation("add-reminder", extra={
             "reminder_id": reminder.get("id"),
@@ -1348,9 +1355,13 @@ def cmd_add_reminder(args):
             "task_content": task.get("content"),
             "minute_offset": minutes,
             "offset_string": offset_str,
+            "is_urgent": bool(reminder.get("is_urgent")),
         })
         fire_date = reminder.get("due", {}).get("date", "?")
-        print(f"  + {format_offset(minutes)} before  (fires: {fire_date}, id: {reminder['id']})")
+        urgent = "  [URGENT]" if reminder.get("is_urgent") else ""
+        print(f"  + {format_offset(minutes)} before{urgent}  (fires: {fire_date}, id: {reminder['id']})")
+        if args.urgent and not reminder.get("is_urgent"):
+            print("    ! server did not echo is_urgent — urgency may not have applied")
 
 
 def cmd_remove_reminder(args):
@@ -1505,6 +1516,8 @@ def main():
     p_add_reminder = sub.add_parser("add-reminder", help="Add reminder(s) before due date")
     p_add_reminder.add_argument("task_id", help="Task ID to add reminders to")
     p_add_reminder.add_argument("offsets", nargs="+", help="Offset(s) before due: 30m, 1h, 1d, 3d, 7d, 1w, 2w")
+    p_add_reminder.add_argument("--urgent", action="store_true",
+                                help="Urgent reminder: full-screen alarm, breaks through silent + DND (iOS 26+)")
 
     # remove-reminder
     p_remove_reminder = sub.add_parser("remove-reminder", help="Delete a reminder")
