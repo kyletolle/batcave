@@ -12,6 +12,12 @@ Usage:
     todoist-brief --markdown            # human-readable markdown
     todoist-brief --days 14             # wider upcoming window
     todoist-brief --project Batcave     # filter to a single project
+    todoist-brief --today 2026-08-11    # tier against a date other than the real today
+
+Note on --today: a caller that builds a brief for a day other than the current
+one (e.g. an evening run producing tomorrow's brief) must pass it. Otherwise
+every task due tomorrow lands in "upcoming" while today's leftovers masquerade
+as "do today".
 """
 from __future__ import annotations
 
@@ -191,7 +197,17 @@ def main() -> int:
     ap.add_argument("--markdown", action="store_true", help="Render as markdown instead of JSON")
     ap.add_argument("--days", type=int, default=7, help="Upcoming window in days (default 7)")
     ap.add_argument("--project", help="Filter to a single project by name")
+    ap.add_argument("--today", help="Treat this YYYY-MM-DD date as 'today' when tiering (default: the real today)")
     args = ap.parse_args()
+
+    if args.today:
+        try:
+            today = date.fromisoformat(args.today)
+        except ValueError:
+            sys.stderr.write(f"Invalid --today date (want YYYY-MM-DD): {args.today}\n")
+            return 1
+    else:
+        today = datetime.now(TZ).date()
 
     projects = get_projects_map()
     project_id = None
@@ -203,7 +219,6 @@ def main() -> int:
         project_id = matches[0]
 
     tasks = get_active_tasks(filter_project_id=project_id)
-    today = datetime.now(TZ).date()
     brief = categorize(tasks, today, args.days, projects)
 
     if args.markdown:
