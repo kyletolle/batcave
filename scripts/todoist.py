@@ -21,6 +21,9 @@ Usage:
     todoist.py remove-reminder REMINDER_ID       Delete a reminder
     todoist.py add-project NAME [options]        Create a project (--color, --parent)
     todoist.py rename-project NAME NEW_NAME      Rename a project
+    todoist.py archive-project NAME              Archive a project (reversible)
+    todoist.py unarchive-project NAME            Restore an archived project
+    todoist.py archived-projects                 List archived projects
     todoist.py delete-project NAME --yes         Delete a project (irreversible)
     todoist.py bulk FILE [--dry-run]             Run many ops from JSON (each logged)
 
@@ -1089,6 +1092,80 @@ def cmd_rename_project(args):
     print(f"Renamed: '{old_name}' → '{updated.get('name', args.new_name)}'")
 
 
+def find_archived_project(name):
+    """Find an archived project by name (case-insensitive, exact then partial).
+
+    Archived projects are absent from GET /projects, so unarchive needs its own
+    lookup. Mirrors find_project's matching so a name that archived cleanly can
+    be typed back verbatim to restore it.
+    """
+    projects = api_get("projects/archived")
+    name_lower = name.lower()
+    for p in projects:
+        if p["name"].lower() == name_lower:
+            return p
+    for p in projects:
+        if name_lower in p["name"].lower():
+            return p
+    return None
+
+
+def cmd_archive_project(args):
+    """Archive a project (audit-logged). Reversible via unarchive-project.
+
+    This is the gentle sibling of delete-project: the project and its tasks stop
+    appearing in lists and counts, but nothing is destroyed. No --yes gate — the
+    whole point is that it costs nothing to undo.
+    """
+    project = find_project(args.project)
+    if not project:
+        print(f"Project '{args.project}' not found.")
+        sys.exit(1)
+
+    # Count contents so the output and the audit record are honest about scope.
+    tasks = api_get("tasks", {"project_id": project["id"]})
+    task_count = len(tasks)
+
+    api_post(f"projects/{project['id']}/archive")
+    log_mutation("archive-project", extra={
+        "project_id": project["id"],
+        "project_name": project["name"],
+        "task_count": task_count,
+    })
+    print(f"Archived project: '{project['name']}' ({task_count} task(s) hidden with it).")
+    print(f"  id: {project['id']}")
+    print(f"  Undo: todoist unarchive-project '{project['name']}'")
+
+
+def cmd_unarchive_project(args):
+    """Restore an archived project (audit-logged)."""
+    project = find_archived_project(args.project)
+    if not project:
+        print(f"Archived project '{args.project}' not found.")
+        print("  Run 'todoist archived-projects' to see what's archived.")
+        sys.exit(1)
+
+    api_post(f"projects/{project['id']}/unarchive")
+    log_mutation("unarchive-project", extra={
+        "project_id": project["id"],
+        "project_name": project["name"],
+    })
+    print(f"Restored project: '{project['name']}'")
+    print(f"  id: {project['id']}")
+
+
+def cmd_archived_projects(args):
+    """List archived projects (read-only)."""
+    projects = api_get("projects/archived")
+    if not projects:
+        print("No archived projects.")
+        return
+    print(f"Archived projects ({len(projects)}):\n")
+    for p in projects:
+        print(f"    {p['name']}")
+        print(f"      id: {p['id']}")
+
+
 def cmd_delete_project(args):
     """Delete a project. Irreversible — requires --yes to execute."""
     project = find_project(args.project)
@@ -1498,6 +1575,17 @@ def main():
     p_rename_project.add_argument("project", help="Current project name")
     p_rename_project.add_argument("new_name", help="New project name")
 
+    # archive-project
+    p_archive_project = sub.add_parser("archive-project", help="Archive a project (reversible)")
+    p_archive_project.add_argument("project", help="Project name to archive")
+
+    # unarchive-project
+    p_unarchive_project = sub.add_parser("unarchive-project", help="Restore an archived project")
+    p_unarchive_project.add_argument("project", help="Archived project name to restore")
+
+    # archived-projects
+    sub.add_parser("archived-projects", help="List archived projects")
+
     # delete-project
     p_delete_project = sub.add_parser("delete-project", help="Delete a project (irreversible)")
     p_delete_project.add_argument("project", help="Project name to delete")
@@ -1546,6 +1634,9 @@ def main():
         "reparent": cmd_reparent,
         "add-project": cmd_add_project,
         "rename-project": cmd_rename_project,
+        "archive-project": cmd_archive_project,
+        "unarchive-project": cmd_unarchive_project,
+        "archived-projects": cmd_archived_projects,
         "delete-project": cmd_delete_project,
         "bulk": cmd_bulk,
         "reminders": cmd_reminders,
