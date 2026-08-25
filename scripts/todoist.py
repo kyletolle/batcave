@@ -791,14 +791,36 @@ def cmd_complete(args):
         print(f"Or complete individual subtasks by their IDs instead.")
         sys.exit(1)
 
-    # Log before completing (can't fetch after it's gone)
+    forever = getattr(args, "forever", False)
+    is_recurring = bool((task.get("due") or {}).get("is_recurring"))
+
+    if forever and not is_recurring:
+        print(f"Note: '{task['content']}' isn't recurring — --forever is a no-op here.")
+
+    # Log before completing (can't fetch after it's gone). The 'before' snapshot is
+    # the restore path for --forever, which drops the recurrence irreversibly.
     extra = None
     if children:
         extra = {"cascade_children": [task_snapshot(c) for c in children]}
-    log_mutation("complete", task_before=task, extra=extra)
+    if forever and is_recurring:
+        extra = dict(extra or {})
+        extra["forever"] = True
+        extra["dropped_recurrence"] = (task.get("due") or {}).get("string")
+
+    log_mutation("complete-forever" if forever else "complete",
+                 task_before=task, extra=extra)
+
+    # Todoist's close endpoint only advances a recurring task to its next occurrence.
+    # To end the series (the UI's "complete recurring task forever"), strip the
+    # recurrence to a one-off first, then close. The audit entry above holds the
+    # original due string if this ever needs undoing.
+    if forever and is_recurring:
+        api_post(f"tasks/{args.task_id}", {"due_string": "today"})
 
     api_post(f"tasks/{args.task_id}/close")
     print(f"Completed: {task['content']} (id: {args.task_id})")
+    if forever and is_recurring:
+        print(f"  (series ended — dropped recurrence: {(task.get('due') or {}).get('string')})")
     if children:
         print(f"  (cascade-completed {len(children)} subtask(s))")
 
@@ -1526,6 +1548,8 @@ def main():
     p_complete = sub.add_parser("complete", help="Complete a task")
     p_complete.add_argument("task_id", help="Task ID to complete")
     p_complete.add_argument("--cascade", action="store_true", help="Confirm cascade-completing all subtasks")
+    p_complete.add_argument("--forever", action="store_true",
+                            help="End a recurring series: drop the recurrence, then complete (no future occurrences)")
 
     p_uncomplete = sub.add_parser("uncomplete", help="Reopen a completed task (undo a complete)")
     p_uncomplete.add_argument("task_id", help="Task ID to reopen")
