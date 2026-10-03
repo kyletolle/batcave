@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from collections import defaultdict
 from pathlib import Path
@@ -69,13 +70,68 @@ def headers():
     return {"Authorization": f"Bearer {TOKEN}"}
 
 
+# --- Transient-failure retry ---
+#
+# Scheduled jobs fire at the top of the hour, which is when the API is busiest;
+# a cron-driven `list` failed fast on most mornings in late September 2026.
+# GETs retry on rate limits, server errors and connection failures. Writes
+# retry only on 429, which the API rejects before doing anything, so a retried
+# write can never land twice.
+
+REQUEST_TIMEOUT = 30          # seconds; requests has no default and will hang
+RETRY_ATTEMPTS = 4            # total tries, including the first
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+RETRY_AFTER_CAP = 60          # never sleep longer than this on one Retry-After
+_sleep = time.sleep           # swapped out in tests
+
+
+def _retry_delay(resp, attempt):
+    """Seconds to wait before the next try: Retry-After if sane, else 2/4/8."""
+    if resp is not None:
+        try:
+            return min(max(float(resp.headers.get("Retry-After", "")), 0), RETRY_AFTER_CAP)
+        except ValueError:
+            pass
+    return 2 ** attempt
+
+
+def _request(method, endpoint, **kwargs):
+    """Send one API request, retrying transient failures. Returns the response.
+
+    Raises requests.HTTPError on a final non-2xx, after printing the status and
+    the start of the body to stderr so cron logs carry the reason.
+    """
+    retry_on = RETRY_STATUSES if method == "GET" else {429}
+    url = f"{API_URL}/{endpoint}"
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        resp = None
+        try:
+            resp = requests.request(method, url, headers=headers(),
+                                    timeout=REQUEST_TIMEOUT, **kwargs)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if method != "GET" or attempt == RETRY_ATTEMPTS:
+                raise
+            reason = type(e).__name__
+        else:
+            if resp.ok:
+                return resp
+            if resp.status_code not in retry_on or attempt == RETRY_ATTEMPTS:
+                print(f"todoist: {method} {endpoint} -> HTTP {resp.status_code}: "
+                      f"{resp.text[:300].strip()}", file=sys.stderr)
+                resp.raise_for_status()
+            reason = f"HTTP {resp.status_code}"
+        delay = _retry_delay(resp, attempt)
+        print(f"todoist: {method} {endpoint} {reason}; retrying in {delay:g}s "
+              f"(attempt {attempt + 1}/{RETRY_ATTEMPTS})", file=sys.stderr)
+        _sleep(delay)
+
+
 def api_get(endpoint, params=None):
     """GET with automatic cursor pagination."""
     all_results = []
     p = dict(params) if params else {}
     while True:
-        resp = requests.get(f"{API_URL}/{endpoint}", headers=headers(), params=p)
-        resp.raise_for_status()
+        resp = _request("GET", endpoint, params=p)
         data = resp.json()
         if isinstance(data, dict) and "results" in data:
             all_results.extend(data["results"])
@@ -90,16 +146,14 @@ def api_get(endpoint, params=None):
 
 
 def api_post(endpoint, json_data=None):
-    resp = requests.post(f"{API_URL}/{endpoint}", headers=headers(), json=json_data)
-    resp.raise_for_status()
+    resp = _request("POST", endpoint, json=json_data)
     if resp.status_code == 204:
         return None
     return resp.json()
 
 
 def api_delete(endpoint):
-    resp = requests.delete(f"{API_URL}/{endpoint}", headers=headers())
-    resp.raise_for_status()
+    resp = _request("DELETE", endpoint)
     if resp.status_code in (200, 204) and not resp.content:
         return None
     try:
@@ -1473,11 +1527,7 @@ def cmd_remove_reminder(args):
         print(f"Reminder {args.reminder_id} not found.")
         sys.exit(1)
 
-    resp = requests.delete(
-        f"{API_URL}/reminders/{args.reminder_id}",
-        headers=headers(),
-    )
-    resp.raise_for_status()
+    api_delete(f"reminders/{args.reminder_id}")
 
     log_mutation("remove-reminder", extra={
         "reminder_id": args.reminder_id,
