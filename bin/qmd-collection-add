@@ -1,18 +1,68 @@
 #!/bin/bash
 # Re-register all 6 QMD collections on the VPS.
 # Run after any bun install -g @tobilu/qmd upgrade — upgrades wipe collection
-# registrations from SQLite. The embed timer becomes a silent no-op without them.
+# registrations. The embed timer becomes a silent no-op without them.
+#
+# ⚠ `qmd collection add --ignore` SILENTLY DROPS THE PATTERN (verified on
+# v2.5.3, 2026-09-05). The YAML schema supports `ignore`, but the CLI's
+# addCollection(name, path, pattern) takes no ignore argument, so the flag is
+# parsed and thrown away. Without the fixup below, the inbox collection
+# re-indexes all of The Batcave a second time — 937 duplicate documents that
+# then eat result slots in every search.
 
 set -e
+
+CONFIG="$HOME/.config/qmd/index.yml"
 
 echo "Registering QMD collections..."
 
 NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/0\ Inbox/The\ Batcave --name batcave
-NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/0\ Inbox --name inbox --ignore "The Batcave/**"
+NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/0\ Inbox --name inbox
 NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/2\ Ideas --name ideas
 NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/4\ Time --name time
 NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/5\ Completed --name completed
 NODE_LLAMA_CPP_GPU=false qmd collection add ~/vault/1\ Projects/Bones\ of\ a\ Broken\ World --name boabw
+
+echo ""
+echo "Restoring the inbox ignore pattern (the CLI drops it)..."
+
+python3 - "$CONFIG" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path) as fh:
+    text = fh.read()
+
+anchor = '  inbox:\n    path: /home/kyle/vault/0 Inbox\n    pattern: "**/*.md"\n'
+patched = anchor + '    ignore:\n      - "The Batcave/**"\n'
+
+if patched in text:
+    print("  already present — nothing to do")
+elif text.count(anchor) == 1:
+    with open(path, "w") as fh:
+        fh.write(text.replace(anchor, patched))
+    print("  ignore pattern restored")
+else:
+    sys.exit(
+        "  ! could not find the inbox block to patch — add this by hand:\n"
+        "      ignore:\n"
+        '        - "The Batcave/**"'
+    )
+PY
+
+echo ""
+echo "Re-indexing so the ignore takes effect..."
+NODE_LLAMA_CPP_GPU=false qmd update
+
+echo ""
+echo "Verifying no duplicate Batcave rows remain in the inbox collection..."
+dupes=$(NODE_LLAMA_CPP_GPU=false qmd ls inbox | grep -c "The-Batcave" || true)
+if [ "$dupes" -eq 0 ]; then
+  echo "  ✓ clean — 0 duplicated Batcave documents"
+else
+  echo "  ! $dupes Batcave documents still indexed under inbox — the ignore did not take"
+  exit 1
+fi
 
 echo ""
 echo "Collections registered. Embed timer will process backlog automatically."
