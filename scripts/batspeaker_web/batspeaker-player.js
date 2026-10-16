@@ -17,6 +17,7 @@
 import { ReadAlong } from "./readalong.js";
 import { silence } from "./audioutil.js";
 import { chunkText } from "./chunker.js";
+import { KokoroWorkerSource } from "./sources.js";
 
 function deferred() {
   let resolve, reject;
@@ -160,12 +161,68 @@ class BatSpeakerSource {
   }
 }
 
+// ---- on-device Kokoro (WebGPU), free: the reader's synthesis worker ----
+//
+// The same kokoro-js worker the reader runs (worker.bundle.js, synced from its
+// build), so the same models: WebGPU fp32 (326 MB) or fp16 (163 MB), fetched
+// from Hugging Face once and cached by the browser for this origin. Kokoro has
+// no word timestamps, so the highlight is the player's length estimate.
+//
+// One worker per page — each model load is hundreds of MB of GPU memory — but
+// a player per turn. LocalKokoroSource gives each turn its own view of the one
+// worker: whoever spoke last owns it, and a turn whose unfinished chunks were
+// taken over just re-claims it (synthesis is free) when you go back to it.
+let kokoro = null;          // the shared KokoroWorkerSource
+let kokoroDtype = null;     // dtype currently loaded (or loading)
+let kokoroLoading = null;   // promise for that load
+let kokoroVoice = "af_heart";
+
+function ensureKokoro(dtype, onProgress) {
+  if (!kokoro) {
+    kokoro = new KokoroWorkerSource({ workerUrl: "./web/worker.bundle.js", getVoice: () => kokoroVoice });
+  }
+  if (kokoroDtype !== dtype || !kokoroLoading) {
+    kokoroDtype = dtype;
+    kokoroLoading = kokoro.load("webgpu", dtype, onProgress)
+      .catch(e => { kokoroLoading = null; kokoroDtype = null; throw e; });
+  }
+  return kokoroLoading;
+}
+
+class LocalKokoroSource {
+  constructor(voice) {
+    this.voice = voice; this.ctx = { status() {}, log() {} };
+    this.job = null; this.slots = []; this.done = [];
+  }
+  attach(ctx) { this.ctx = ctx; }
+  begin(job) { this.job = job; this._claim(); }
+  _claim() {
+    kokoro.attach(this.ctx);
+    kokoroVoice = this.voice;
+    kokoro.begin(this.job);
+    this.slots = kokoro.slots.slice();
+    this.done = this.slots.map(() => false);
+    this.slots.forEach((d, i) => d.promise.then(() => { this.done[i] = true; }));
+  }
+  synthChunk(i) {
+    if (!this.job || !this.slots[i]) {
+      return Promise.resolve({ audioUrl: silence(), wordTimings: null, duration: 0.2 });
+    }
+    if (!this.done[i] && kokoro.job !== this.job) this._claim();
+    return this.slots[i].promise;
+  }
+  // Deliberately a no-op: after Stop the worker keeps filling this turn's
+  // chunks, so replaying it is instant. A newer turn's begin() supersedes.
+  cancel() {}
+}
+
 // Mount a player into `root` for one turn and start it. Returns the ReadAlong
-// instance. opts: { session, turnId, text, html, whole, onDone }.
+// instance. opts: { session, turnId, text, html, whole, local, onDone }.
+// opts.local = { dtype, voice } voices the turn on this device instead of /tts.
 window.mountReadAlong = function (root, opts) {
-  const source = new BatSpeakerSource({
-    session: opts.session, turnId: opts.turnId, whole: !!opts.whole,
-  });
+  const source = opts.local
+    ? new LocalKokoroSource(opts.local.voice)
+    : new BatSpeakerSource({ session: opts.session, turnId: opts.turnId, whole: !!opts.whole });
   const player = new ReadAlong(root, source, {
     prepare: t => (opts.whole ? prepareOne(t, opts.html) : prepareChunked(t, opts.html)),
     getMd: () => false,
@@ -180,6 +237,31 @@ window.mountReadAlong = function (root, opts) {
     onStatus: m => { if (m === "done" && opts.onDone) opts.onDone(); },
     onLog: m => { try { console.log("[RA]", m); } catch (e) {} },
   });
-  player.speak(opts.text || "");
+  if (!opts.local) {
+    player.speak(opts.text || "");
+    return player;
+  }
+  // First on-device Speak downloads the model; show progress in the player's
+  // own status line, then speak once it's ready.
+  const status = m => player._status(m);
+  const mb = b => (b / 1048576).toFixed(0);
+  if (!kokoro || !kokoro.ready || kokoroDtype !== opts.local.dtype) status("loading on-device voice…");
+  ensureKokoro(opts.local.dtype, m => status(m.total
+    ? `downloading voice model — ${mb(m.loaded)}/${mb(m.total)} MB (once, then cached)`
+    : `downloading voice model — ${mb(m.loaded)} MB (once, then cached)`))
+    .then(() => { status(""); player.speak(opts.text || ""); })
+    .catch(e => status(`on-device voice failed: ${e.message}`));
   return player;
+};
+
+// Can this browser run the on-device voice? Chromium desktop with a WebGPU
+// adapter (the page separately checks /config that the worker bundle is
+// installed). Firefox's WebGPU garbles Kokoro even
+// at fp32, and on iOS WebGPU fp16 is static and fp32 crashes the tab (both
+// measured in the reader), so those never see the option.
+window.localVoiceSupported = async function () {
+  const ua = navigator.userAgent;
+  if (!navigator.gpu || !/Chrome\//.test(ua) || /Mobile|Android/.test(ua)) return false;
+  try { return !!(await navigator.gpu.requestAdapter()); }
+  catch (e) { return false; }
 };

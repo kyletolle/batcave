@@ -55,6 +55,7 @@ KOKORO_VOICES = core.KOKORO_VOICES
 # formalize these into one nullsix package). Resolved beside this script — stable
 # within the repo, unlike the vault-root __file__ idiom that broke at the cutover.
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "batspeaker_web")
+LOCAL_WORKER = os.path.join(WEB_DIR, "worker.bundle.js")
 
 ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -437,6 +438,15 @@ PAGE = r"""<!DOCTYPE html>
   <select id="cfgVoice"></select>
   <label>Unreal voice</label>
   <select id="cfgUnrealVoice"></select>
+  <div id="localWrap" class="hidden">
+    <label>On this device</label>
+    <select id="localVoice">
+      <option value="">Server voice (engine above)</option>
+      <option value="fp32">On-device Kokoro, WebGPU fp32 (326 MB)</option>
+      <option value="fp16">On-device Kokoro, WebGPU fp16 (163 MB)</option>
+    </select>
+    <p class="sub" style="margin:.4rem 0 0;">Free: this browser's GPU speaks the turn in the Kokoro voice above. The model downloads once, then it's cached. Applies right away, to this browser only. Turns the server already voiced still play their saved audio, and auto-speak still uses the server.</p>
+  </div>
   <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize. Speed lives on each turn's player now (it remembers your last choice).</p>
 
   <div class="sect">Actions</div>
@@ -541,10 +551,13 @@ function mountPlayer(card, {onDone=null}={}){
   const row = card.querySelector(":scope > .row"); if(row) row.style.display="none";
   // Cached whole-turn audio (listen-mode pre-synth) plays as one chunk — it's
   // already instant. Fresh turns take the progressive chunked path: playback
-  // starts on chunk 1 while the rest synthesizes.
+  // starts on chunk 1 while the rest synthesizes — on this device's GPU when
+  // the on-device voice is on (cached server audio still wins: it's paid for).
+  const dtype = localVoiceMode();
+  const local = (dtype && !card._hasAudio) ? {dtype, voice:kokoroVoice} : null;
   card._player = window.mountReadAlong(card.querySelector(".player"),
     {session:active, turnId:card.dataset.id, text, html:card._raHtml,
-     whole:card._hasAudio, onDone});
+     whole:card._hasAudio, local, onDone});
   return card._player;
 }
 
@@ -615,8 +628,32 @@ function fillVoices(sel, voices, current){
   (voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
     if(v===current) o.selected=true; sel.appendChild(o); });
 }
+// ---- on-device voice (per browser, localStorage) ----
+let kokoroVoice = "af_heart", localVoiceOK = false;
+function localVoiceMode(){
+  if(!localVoiceOK) return "";
+  try{ return localStorage.getItem("batspeaker.localVoice") || ""; }catch(e){ return ""; }
+}
+async function initLocalVoice(){
+  try{
+    const c = await (await fetch("./config")).json();
+    kokoroVoice = c.kokoro_voice || kokoroVoice;
+    localVoiceOK = !!c.local_voice && !!window.localVoiceSupported &&
+                   await window.localVoiceSupported();
+  }catch(e){ localVoiceOK = false; }
+  $("#localWrap").classList.toggle("hidden", !localVoiceOK);
+  $("#localVoice").value = localVoiceMode();
+}
+$("#localVoice").onchange = e => {
+  try{ localStorage.setItem("batspeaker.localVoice", e.target.value); }catch(err){}
+  toast(e.target.value ? "On-device voice on" : "Using the server voice");
+};
+// The player module (and localVoiceSupported) loads deferred, after this script.
+window.addEventListener("load", initLocalVoice);
+
 async function loadConfig(){
   const r = await fetch("./config"); const c = await r.json();
+  kokoroVoice = c.kokoro_voice || kokoroVoice;
   fillVoices($("#cfgVoice"), c.voices, c.voice);
   fillVoices($("#cfgUnrealVoice"), c.unreal_voices, c.unreal_voice);
   fillVoices($("#cfgInworldVoice"), c.inworld_voices, c.inworld_voice);
@@ -631,6 +668,7 @@ $("#cfgSave").onclick = async ()=>{
                           unreal_voice:$("#cfgUnrealVoice").value,
                           inworld_voice:$("#cfgInworldVoice").value,
                           kokoro_voice:$("#cfgKokoroVoice").value})});
+  kokoroVoice = $("#cfgKokoroVoice").value || kokoroVoice;
   toast("Saved"); $("#panel").classList.remove("open");
 };
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
@@ -715,7 +753,10 @@ class Handler(BaseHTTPRequestHandler):
                                     "inworld_voice": cfg.get("inworld_voice"),
                                     "inworld_voices": INWORLD_VOICES,
                                     "kokoro_voice": cfg.get("kokoro_voice"),
-                                    "kokoro_voices": KOKORO_VOICES})
+                                    "kokoro_voices": KOKORO_VOICES,
+                                    # on-device voice needs the reader's built
+                                    # worker (synced, gitignored) to be present
+                                    "local_voice": os.path.isfile(LOCAL_WORKER)})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})
