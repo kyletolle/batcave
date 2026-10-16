@@ -14,6 +14,7 @@ proven, the hook + Live note can be retired and this becomes the only path.
 """
 
 import os, re, json, glob, html, subprocess, time
+from html.parser import HTMLParser
 
 # ---------- paths / config ----------
 
@@ -188,10 +189,17 @@ def turn_full_md(turn):
     return _join_runs(turn["runs"])
 
 
+def turn_read_along(turn):
+    """(pane html, spoken text) for the read-along view: the turn's substance
+    (narration trimmed) rendered as markdown, with one word-span per spoken word.
+    Both come from one pass, so the formatted pane and the audio can't drift."""
+    return read_along(_join_runs(_spoken_runs(turn["runs"])))
+
+
 def turn_spoken_text(turn):
-    """The substance of the turn, sanitized for TTS (whole turn, narration
+    """The substance of the turn, as TTS speaks it (whole turn, narration
     trimmed)."""
-    return sanitize(_join_runs(_spoken_runs(turn["runs"])))
+    return turn_read_along(turn)[1]
 
 
 # ---------- session discovery ----------
@@ -487,6 +495,159 @@ def md_to_html(md):
             i += 1
         out.append("<p>" + _inline(" ".join(para)) + "</p>")
     return "\n".join(out)
+
+
+# ---------- read-along pane: formatted markdown + spoken word-spans ----------
+#
+# The player pane used to be a flat wall of word-spans built from sanitize()'s
+# output, so every heading, list and table collapsed into one paragraph. Now the
+# pane is md_to_html()'s output with each spoken word wrapped in
+# <span class="w" data-g=N>, and the spoken text is assembled from those same
+# words — span N is word N of the text's whitespace split, which is the contract
+# the client (batspeaker-player.js) and _align_words both rely on.
+#
+# What sanitize() did by regex happens per word here: code blocks and bare URLs
+# are shown but not spoken, emphasis markers are dropped, em dashes become
+# commas. Table cells gain a spoken comma (and rows a period) so a table reads as
+# a list of rows instead of one run-on line.
+
+_RA_BLOCK = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
+             "blockquote", "pre", "div", "table", "thead", "tbody", "tr",
+             "th", "td", "hr", "br"}
+_RA_SOFT = {"td": " ", "th": " ", "br": "\n"}
+_RA_DASH = re.compile(r"(—|--)")
+_RA_URL = re.compile(r"^https?://")
+_RA_TOKEN = re.compile(r"\s+|\S+")
+
+
+def _has_alnum(s):
+    return any(c.isalnum() for c in s)
+
+
+class _ReadAlongBuilder(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out = []          # pane html pieces
+        self.words = []        # spoken words, one per span
+        self.seps = []         # separator before each word (" " or "\n\n")
+        self._boundary = True  # whitespace/block seen since the last word
+        self._block = False    # a block boundary since the last word
+        self._sep = " "        # spoken separator that boundary will take
+        self._pre = 0          # inside <pre>: shown, not spoken
+        self._link = 0         # inside <a>: words get .lnk, no live anchor
+        self._cell_start = 0   # len(words) when the current table cell opened
+
+    def _mark_block(self, tag):
+        # Cells and line breaks separate words within one spoken paragraph;
+        # every other block starts a new one (and a new chunker paragraph).
+        if not self._block:
+            self._sep = _RA_SOFT.get(tag, "\n\n")
+        elif _RA_SOFT.get(tag, "\n\n") == "\n\n":
+            self._sep = "\n\n"
+        self._boundary = True
+        self._block = True
+
+    def _punctuate(self, start, mark):
+        """End the last word with `mark` if it was spoken after `start` and has
+        no terminal punctuation yet (a trailing comma upgrades to a period)."""
+        if len(self.words) > start:
+            w = self.words[-1]
+            if w.endswith(",") and mark == ".":
+                self.words[-1] = w[:-1] + "."
+            elif not w.endswith((".", ",", ";", ":", "!", "?")):
+                self.words[-1] = w + mark
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self._link += 1
+            return
+        if tag in _RA_BLOCK:
+            self._mark_block(tag)
+        if tag == "pre":
+            self._pre += 1
+        if tag == "tr":
+            self._row_start = len(self.words)
+        if tag in ("td", "th"):
+            self._cell_start = len(self.words)
+        self.out.append(self.get_starttag_text())
+
+    def handle_startendtag(self, tag, attrs):
+        if tag in _RA_BLOCK:
+            self._mark_block(tag)
+        self.out.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if tag == "a":
+            self._link = max(0, self._link - 1)
+            return
+        if tag == "pre":
+            self._pre = max(0, self._pre - 1)
+        if tag in ("td", "th"):
+            self._punctuate(self._cell_start, ",")
+        if tag == "tr":
+            self._punctuate(getattr(self, "_row_start", 0), ".")
+        if tag in _RA_BLOCK:
+            self._mark_block(tag)
+        self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        if self._pre:
+            self.out.append(html.escape(data, quote=False))
+            return
+        for tok in _RA_TOKEN.findall(data):
+            if tok.isspace():
+                self.out.append(tok)
+                self._boundary = True
+                continue
+            for piece in _RA_DASH.split(tok):
+                if piece:
+                    self._piece(piece)
+
+    def _piece(self, piece):
+        shown = html.escape(piece, quote=False)
+        if _RA_DASH.fullmatch(piece):
+            # TTS garbles words around em dashes; speak a comma instead.
+            self.out.append(shown)
+            if self.words and not self._block:
+                self._punctuate(0, ",")
+            self._boundary = True
+            return
+        if _RA_URL.match(piece):           # bare URL: shown, never read out
+            self.out.append(shown)
+            self._boundary = True
+            return
+        spoken = re.sub(r"[*_~]+", "", piece)
+        if not _has_alnum(spoken):
+            # Lone punctuation/symbols ride on the previous word, unhighlighted.
+            self.out.append(shown)
+            if spoken and self.words and not self._block:
+                self.words[-1] += spoken
+            return
+        if not self._boundary and self.words and not self._block:
+            # No space since the last word ("**foo**bar", "`x`'s"): one spoken
+            # word, so the tail stays outside the span.
+            self.out.append(shown)
+            self.words[-1] += spoken
+            return
+        cls = "w lnk" if self._link else "w"
+        self.out.append(f'<span class="{cls}" data-g="{len(self.words)}">{shown}</span>')
+        self.seps.append(self._sep if self._block else " ")
+        self.words.append(spoken)
+        self._boundary = self._block = False
+
+
+def read_along(md):
+    """Render markdown for the read-along pane. Returns (html, spoken_text):
+    html has one <span class="w" data-g=N> per spoken word, and
+    spoken_text.split() is exactly those words, in order."""
+    md = re.sub(r"!\[\[[^\]]*\]\]", " ", md)                       # embeds
+    md = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", md)                  # images
+    md = re.sub(r"\[([^\]]*)\]\((?!https?://)[^)]*\)", r"\1", md)  # relative links
+    b = _ReadAlongBuilder()
+    b.feed(md_to_html(md))
+    b.close()
+    text = "".join(sep + w for sep, w in zip(b.seps, b.words)).strip()
+    return "".join(b.out), text
 
 
 # ---------- TTS synthesis ----------
