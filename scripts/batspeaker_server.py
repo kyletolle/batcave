@@ -330,6 +330,25 @@ PAGE = r"""<!DOCTYPE html>
                  margin:auto auto 0;
                  border-radius:.8rem .8rem 0 0; border:1px solid var(--line);
                  padding:1rem 1rem max(1rem, env(safe-area-inset-bottom)); }
+  /* Voice picker: one row per provider. The active one is outlined and opens to
+     show only its own settings; the rest collapse to name + what they'd use. */
+  #panel .nowvoice { font-size:.95rem; margin:.2rem 0 .6rem; }
+  #panel .nowvoice b { color:var(--acc); font-weight:600; }
+  #panel .nowvoice .sub { display:block; margin-top:.15rem; }
+  .prov { border:1px solid var(--line); border-radius:.55rem; background:var(--panel2);
+          margin:.4rem 0; }
+  .prov.active { border-color:var(--acc); }
+  .prov > .head { display:flex; align-items:baseline; gap:.5rem; width:100%;
+                  text-align:left; background:none; border:0; padding:.55rem .7rem; }
+  .prov > .head .nm { font-weight:600; flex:0 0 auto; }
+  .prov > .head .what { color:var(--mut); font-size:.8rem; flex:1; min-width:0;
+                        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .prov > .head .tag { flex:0 0 auto; font-size:.7rem; color:#14161a; background:var(--acc);
+                       border-radius:.3rem; padding:.05rem .35rem; }
+  .prov > .head .tag.alt { background:none; color:var(--mut); border:1px solid var(--line); }
+  .prov > .opts { display:none; padding:0 .7rem .65rem; }
+  .prov.active > .opts { display:block; }
+  #panel .prov > .opts label:first-child { margin-top:0; }
   #panel label { display:block; margin:.6rem 0 .2rem; color:var(--mut); font-size:.85rem; }
   #panel select, #panel input[type=number] { width:100%; padding:.45rem; background:var(--panel2);
        color:var(--fg); border:1px solid var(--line); border-radius:.45rem; }
@@ -421,33 +440,9 @@ PAGE = r"""<!DOCTYPE html>
     <span>Auto-speak this conversation</span></label>
 
   <div class="sect">Voice</div>
-  <label>Engine</label>
-  <select id="cfgEngine">
-    <option value="inworld">Inworld</option>
-    <option value="kokoro-deepinfra">Kokoro (DeepInfra)</option>
-    <option value="openai">OpenAI</option>
-    <option value="deepgram">Deepgram</option>
-    <option value="elevenlabs">ElevenLabs</option>
-    <option value="unreal">Unreal Speech</option>
-  </select>
-  <label>Inworld voice</label>
-  <select id="cfgInworldVoice"></select>
-  <label>Kokoro voice</label>
-  <select id="cfgKokoroVoice"></select>
-  <label>OpenAI voice</label>
-  <select id="cfgVoice"></select>
-  <label>Unreal voice</label>
-  <select id="cfgUnrealVoice"></select>
-  <div id="localWrap" class="hidden">
-    <label>On this device</label>
-    <select id="localVoice">
-      <option value="">Server voice (engine above)</option>
-      <option value="fp32">On-device Kokoro, WebGPU fp32 (326 MB)</option>
-      <option value="fp16">On-device Kokoro, WebGPU fp16 (163 MB)</option>
-    </select>
-    <p class="sub" style="margin:.4rem 0 0;">Free: this browser's GPU speaks the turn in the Kokoro voice above. The model downloads once, then it's cached. Applies right away, to this browser only. Turns the server already voiced still play their saved audio, and auto-speak still uses the server.</p>
-  </div>
-  <p class="sub" style="margin:.5rem 0 0;">Voice changes apply to the next turn you synthesize. Speed lives on each turn's player now (it remembers your last choice).</p>
+  <div class="nowvoice" id="nowVoice"></div>
+  <div id="providers"></div>
+  <p class="sub" style="margin:.5rem 0 0;">Changes apply right away. Server voices are one shared setting for every device and for auto-speak; the on-device voice applies to this browser only. Speed lives on each turn's player.</p>
 
   <div class="sect">Actions</div>
   <div class="row">
@@ -456,7 +451,6 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="row" style="margin-top:1.2rem;">
-    <button id="cfgSave">Save</button>
     <span class="grow"></span>
     <button id="panelClose">Close</button>
   </div>
@@ -622,12 +616,6 @@ $("#listenToggle").onchange = async e => {
   if(on && !audioUnlocked) toast("Tap ▶︎ Listen to allow audio");
 };
 
-// ---- settings ----
-function fillVoices(sel, voices, current){
-  sel.innerHTML="";
-  (voices||[]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v;
-    if(v===current) o.selected=true; sel.appendChild(o); });
-}
 // ---- on-device voice (per browser, localStorage) ----
 let kokoroVoice = "af_heart", localVoiceOK = false;
 function localVoiceMode(){
@@ -641,36 +629,106 @@ async function initLocalVoice(){
     localVoiceOK = !!c.local_voice && !!window.localVoiceSupported &&
                    await window.localVoiceSupported();
   }catch(e){ localVoiceOK = false; }
-  $("#localWrap").classList.toggle("hidden", !localVoiceOK);
-  $("#localVoice").value = localVoiceMode();
+  if($("#panel").classList.contains("open")) loadConfig();   // opened before detection finished
 }
-$("#localVoice").onchange = e => {
-  try{ localStorage.setItem("batspeaker.localVoice", e.target.value); }catch(err){}
-  toast(e.target.value ? "On-device voice on" : "Using the server voice");
-};
 // The player module (and localVoiceSupported) loads deferred, after this script.
 window.addEventListener("load", initLocalVoice);
 
+// ---- settings: the voice picker ----
+// One row per provider. Server providers share one setting (config.json, every
+// device + auto-speak); "Kokoro on this device" is this browser's override, in
+// localStorage. Whatever this browser would actually use is the active row.
+let cfg = {};
+const PROVIDERS = [
+  {id:"inworld", name:"Inworld", note:"server · paid · exact word highlight",
+   opts:[{label:"Voice", key:"inworld_voice", list:"inworld_voices"}]},
+  {id:"local", name:"Kokoro on this device", note:"free · WebGPU · this browser only",
+   opts:[{label:"Model", local:true},
+         {label:"Voice", key:"kokoro_voice", list:"kokoro_voices"}]},
+  {id:"kokoro-deepinfra", name:"Kokoro (DeepInfra)", note:"server · cheap",
+   opts:[{label:"Voice", key:"kokoro_voice", list:"kokoro_voices"}]},
+  {id:"openai", name:"OpenAI", note:"server · paid",
+   opts:[{label:"Voice", key:"voice", list:"voices"}]},
+  {id:"unreal", name:"Unreal Speech", note:"server · exact word highlight",
+   opts:[{label:"Voice", key:"unreal_voice", list:"unreal_voices"}]},
+  {id:"deepgram", name:"Deepgram", note:"server · cheapest",
+   opts:[{label:"Voice", key:"deepgram_voice", fixed:true}]},
+  {id:"elevenlabs", name:"ElevenLabs", note:"server · priciest",
+   opts:[{label:"Voice", key:"elevenlabs_voice", fixed:true}]},
+];
+const LOCAL_MODELS = [["fp32","WebGPU fp32 (326 MB, best)"], ["fp16","WebGPU fp16 (163 MB)"]];
+const provName = id => (PROVIDERS.find(p=>p.id===id)||{name:id}).name;
+function voiceFor(id){
+  if(id==="local") return `${cfg.kokoro_voice||kokoroVoice}, ${localVoiceMode()||lastLocalModel()}`;
+  const p = PROVIDERS.find(x=>x.id===id); const o = p && p.opts.find(x=>x.key);
+  return o ? (cfg[o.key]||"") : "";
+}
+function activeProvider(){ return localVoiceMode() ? "local" : (cfg.engine||"inworld"); }
+function lastLocalModel(){ try{ return localStorage.getItem("batspeaker.localModel") || "fp32"; }catch(e){ return "fp32"; } }
+function setLocalMode(v){
+  try{ localStorage.setItem("batspeaker.localVoice", v); if(v) localStorage.setItem("batspeaker.localModel", v); }catch(e){}
+}
+
+function renderProviders(){
+  const act = activeProvider(), server = cfg.engine||"inworld";
+  $("#nowVoice").innerHTML =
+    `Speaking with <b>${escapeHtml(provName(act))}</b> · ${escapeHtml(voiceFor(act))}` +
+    (act==="local" ? `<span class="sub">Other devices and auto-speak: ${escapeHtml(provName(server))} · ${escapeHtml(voiceFor(server))}</span>` : "");
+  const box = $("#providers"); box.innerHTML = "";
+  for(const p of PROVIDERS){
+    if(p.id==="local" && !localVoiceOK) continue;
+    const row = document.createElement("div");
+    row.className = "prov" + (p.id===act ? " active" : "");
+    const tag = p.id===act ? `<span class="tag">Active</span>`
+      : (act==="local" && p.id===server ? `<span class="tag alt">Server default</span>` : "");
+    const v = voiceFor(p.id);
+    row.innerHTML = `<button class="head"><span class="nm">${escapeHtml(p.name)}</span>` +
+      `<span class="what">${escapeHtml((v ? v+" · " : "") + p.note)}</span>${tag}</button>` +
+      `<div class="opts"></div>`;
+    row.querySelector(".head").onclick = () => chooseProvider(p.id);
+    const opts = row.querySelector(".opts");
+    for(const o of p.opts){
+      const lab = document.createElement("label"); lab.textContent = o.label; opts.appendChild(lab);
+      if(o.fixed){
+        const d = document.createElement("div"); d.className = "sub";
+        d.textContent = `${cfg[o.key]||"default"} (set in config.json)`; opts.appendChild(d); continue;
+      }
+      const sel = document.createElement("select");
+      const items = o.local ? LOCAL_MODELS : (cfg[o.list]||[]).map(x=>[x,x]);
+      const cur = o.local ? (localVoiceMode()||lastLocalModel()) : cfg[o.key];
+      for(const [val,txt] of items){ const op = document.createElement("option");
+        op.value = val; op.textContent = txt; if(val===cur) op.selected = true; sel.appendChild(op); }
+      sel.onchange = () => o.local
+        ? (setLocalMode(sel.value), renderProviders(), toast("Saved"))
+        : saveCfg({[o.key]: sel.value});
+      opts.appendChild(sel);
+    }
+    box.appendChild(row);
+  }
+}
+async function saveCfg(updates){
+  await fetch("./config",{method:"POST",headers:{"Content-Type":"application/json"},
+    body: JSON.stringify(updates)});
+  Object.assign(cfg, updates);
+  if(updates.kokoro_voice) kokoroVoice = updates.kokoro_voice;
+  renderProviders(); toast("Saved");
+}
+async function chooseProvider(id){
+  if(id===activeProvider()) return;
+  if(id==="local"){
+    setLocalMode(lastLocalModel()); renderProviders(); toast("On-device voice on (this browser)"); return;
+  }
+  setLocalMode("");   // a server provider takes over this browser too
+  if(id!==(cfg.engine||"inworld")) await saveCfg({engine:id});
+  else { renderProviders(); toast(`Using ${provName(id)}`); }
+}
 async function loadConfig(){
-  const r = await fetch("./config"); const c = await r.json();
-  kokoroVoice = c.kokoro_voice || kokoroVoice;
-  fillVoices($("#cfgVoice"), c.voices, c.voice);
-  fillVoices($("#cfgUnrealVoice"), c.unreal_voices, c.unreal_voice);
-  fillVoices($("#cfgInworldVoice"), c.inworld_voices, c.inworld_voice);
-  fillVoices($("#cfgKokoroVoice"), c.kokoro_voices, c.kokoro_voice);
-  $("#cfgEngine").value = c.engine||"inworld";
+  const r = await fetch("./config"); cfg = await r.json();
+  kokoroVoice = cfg.kokoro_voice || kokoroVoice;
+  renderProviders();
 }
 $("#menuBtn").onclick = ()=>{ loadConfig(); $("#panel").classList.add("open"); };
 $("#panelClose").onclick = ()=> $("#panel").classList.remove("open");
-$("#cfgSave").onclick = async ()=>{
-  await fetch("./config",{method:"POST",headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({engine:$("#cfgEngine").value, voice:$("#cfgVoice").value,
-                          unreal_voice:$("#cfgUnrealVoice").value,
-                          inworld_voice:$("#cfgInworldVoice").value,
-                          kokoro_voice:$("#cfgKokoroVoice").value})});
-  kokoroVoice = $("#cfgKokoroVoice").value || kokoroVoice;
-  toast("Saved"); $("#panel").classList.remove("open");
-};
 $("#cfgRestart").onclick = async ()=>{ toast("Restarting…");
   await fetch("./restart",{method:"POST"}); setTimeout(()=>location.reload(),4000); };
 $("#reloadBtn").onclick = ()=>{ loadSessions(); $("#panel").classList.remove("open"); };
@@ -754,6 +812,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "inworld_voices": INWORLD_VOICES,
                                     "kokoro_voice": cfg.get("kokoro_voice"),
                                     "kokoro_voices": KOKORO_VOICES,
+                                    "deepgram_voice": cfg.get("deepgram_voice"),
+                                    "elevenlabs_voice": cfg.get("elevenlabs_voice"),
                                     # on-device voice needs the reader's built
                                     # worker (synced, gitignored) to be present
                                     "local_voice": os.path.isfile(LOCAL_WORKER)})
