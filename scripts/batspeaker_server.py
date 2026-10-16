@@ -137,9 +137,10 @@ def turn_payload(turn, with_html=True):
     }
     if with_html:
         p["html"] = core.md_to_html(core.turn_full_md(turn))
-        # Spoken text (markdown stripped) drives the player's word-spans, so the
-        # read-along highlight tracks the exact word order the TTS speaks.
-        p["text"] = core.turn_spoken_text(turn)
+        # The read-along pane: the spoken substance rendered as markdown, one
+        # word-span per spoken word. Spoken text and pane come from one pass, so
+        # the highlight tracks the exact word order the TTS speaks.
+        p["ra_html"], p["text"] = core.turn_read_along(turn)
     return p
 
 
@@ -253,21 +254,23 @@ PAGE = r"""<!DOCTYPE html>
              display:flex; align-items:baseline; gap:.6rem; }
   .turn .q .qt { flex:1; min-width:0; white-space:pre-wrap; }
   .turn .q .ts { flex:0 0 auto; font-size:.72rem; opacity:.8; }
-  .turn .body p:first-child { margin-top:0; }
-  .turn .body p:last-child { margin-bottom:0; }
-  .turn .body pre { background:#0b0d11; border:1px solid var(--line);
+  /* .ra-pane = the read-along view of the same markdown, so it wears the
+     card's styles. */
+  .turn .body p:first-child,.turn .ra-pane p:first-child { margin-top:0; }
+  .turn .body p:last-child,.turn .ra-pane p:last-child { margin-bottom:0; }
+  .turn .body pre,.turn .ra-pane pre { background:#0b0d11; border:1px solid var(--line);
                     border-radius:.4rem; padding:.6rem; overflow-x:auto; font-size:.85rem; }
-  .turn .body code { background:#0b0d11; padding:.05rem .3rem; border-radius:.3rem; font-size:.9em; }
-  .turn .body blockquote { color:var(--mut); border-left:3px solid var(--line);
+  .turn .body code,.turn .ra-pane code { background:#0b0d11; padding:.05rem .3rem; border-radius:.3rem; font-size:.9em; }
+  .turn .body blockquote,.turn .ra-pane blockquote { color:var(--mut); border-left:3px solid var(--line);
                            margin:.5rem 0; padding-left:.7rem; }
-  .turn .body h1,.turn .body h2,.turn .body h3 { font-size:1.05rem; margin:.7rem 0 .35rem; }
+  .turn .body h1,.turn .body h2,.turn .body h3,.turn .ra-pane h1,.turn .ra-pane h2,.turn .ra-pane h3 { font-size:1.05rem; margin:.7rem 0 .35rem; }
   /* tables — the wrapper scrolls sideways on a phone instead of widening the card.
      Column alignment arrives as an inline style from the markdown, which wins. */
-  .turn .body .tbl-wrap { overflow-x:auto; margin:.6rem 0; -webkit-overflow-scrolling:touch; }
-  .turn .body table { border-collapse:collapse; font-size:.85rem; line-height:1.45; }
-  .turn .body th,.turn .body td { border:1px solid var(--line); padding:.35rem .55rem;
+  .turn .body .tbl-wrap,.turn .ra-pane .tbl-wrap { overflow-x:auto; margin:.6rem 0; -webkit-overflow-scrolling:touch; }
+  .turn .body table,.turn .ra-pane table { border-collapse:collapse; font-size:.85rem; line-height:1.45; }
+  .turn .body th,.turn .body td,.turn .ra-pane th,.turn .ra-pane td { border:1px solid var(--line); padding:.35rem .55rem;
                                   text-align:left; vertical-align:top; }
-  .turn .body th { background:#0b0d11; font-weight:600; }
+  .turn .body th,.turn .ra-pane th { background:#0b0d11; font-weight:600; }
   /* Landscape on a phone started at 157px of chrome on a 306px viewport — 51%,
      about four lines to read in. Merging the two bars into one did most of the
      work; this trims what's left. Final: 79px (26%), so the reading area went
@@ -341,6 +344,7 @@ PAGE = r"""<!DOCTYPE html>
   .ra-pane { font-size:1rem; line-height:1.9; }
   .ra-pane .w { padding:0 1px; border-radius:3px; cursor:pointer; }
   .ra-pane .w.cur { background:var(--acc); color:#14161a; }
+  .ra-pane .w.lnk { text-decoration:underline dotted; text-underline-offset:3px; }
   .ra-controls { position:sticky; bottom:0; background:var(--panel);
                  padding-top:.4rem; margin-top:.5rem; border-top:1px solid var(--line); }
   .ra-controls .row { display:flex; align-items:center; gap:.4rem; margin:.4rem 0; flex-wrap:wrap; }
@@ -503,6 +507,7 @@ function renderTurn(t){
   const card = document.createElement("div");
   card.className = "turn"; card.dataset.id = t.id;
   card._text = t.text || "";
+  card._raHtml = t.ra_html || "";   // formatted read-along pane (word-spanned)
   card._hasAudio = !!t.audio_url;   // whole-turn audio already cached server-side
   // Speak + timestamp sit at the card bottom but STICK to the bottom of the
   // screen (.turn > .row is position:sticky) so Speak is always in view no matter
@@ -538,7 +543,8 @@ function mountPlayer(card, {onDone=null}={}){
   // already instant. Fresh turns take the progressive chunked path: playback
   // starts on chunk 1 while the rest synthesizes.
   card._player = window.mountReadAlong(card.querySelector(".player"),
-    {session:active, turnId:card.dataset.id, text, whole:card._hasAudio, onDone});
+    {session:active, turnId:card.dataset.id, text, html:card._raHtml,
+     whole:card._hasAudio, onDone});
   return card._player;
 }
 
@@ -554,6 +560,7 @@ function openStream(id){
       const card = $(`.turn[data-id="${cssEsc(t.id)}"]`);
       if(card){
         card._text = t.text || card._text;
+        card._raHtml = t.ra_html || card._raHtml;
         if(t.audio_url) card._hasAudio = true;
         const body = card.querySelector(".body");
         if(body && !card._player) body.innerHTML = t.html||"";

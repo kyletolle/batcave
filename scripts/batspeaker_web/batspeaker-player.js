@@ -36,19 +36,43 @@ function spanHTML(chunks) {
   ).join(" ");
 }
 
+// Formatted pane: the server renders the turn's markdown with one
+// <span class="w" data-g=N> per spoken word, N indexing the spoken text's
+// whitespace split (core.read_along). Chunking only regroups that split, so
+// stamping each span with its chunk/word coordinates is all the shared player
+// needs to highlight and seek inside real headings, lists and tables. Any
+// count mismatch returns null and the caller falls back to flat spans.
+function stampSpans(html, chunks) {
+  if (!html) return null;
+  const coords = [];
+  chunks.forEach((words, c) => words.forEach((_, w) => coords.push([c, w])));
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const spans = tpl.content.querySelectorAll(".w[data-g]");
+  if (spans.length !== coords.length) return null;
+  for (const s of spans) {
+    const at = coords[+s.dataset.g];
+    if (!at) return null;
+    s.dataset.c = at[0]; s.dataset.w = at[1];
+    s.removeAttribute("data-g");
+  }
+  return tpl.innerHTML;
+}
+
 // whole-turn mode: a single chunk spanning the turn.
-function prepareOne(text) {
+function prepareOne(text, html) {
   const words = (text || "").split(/\s+/).filter(Boolean);
-  return { html: spanHTML([words]), chunks: [words] };
+  const chunks = [words];
+  return { html: stampSpans(html, chunks) || spanHTML(chunks), chunks };
 }
 
 // chunked mode: chunker.js ramps 140→260→400 chars so chunk 1 synthesizes fast
 // (TTFA) and later chunks amortize request overhead.
-function prepareChunked(text) {
+function prepareChunked(text, html) {
   const chunks = chunkText(text || "")
     .map(c => c.split(/\s+/).filter(Boolean))
     .filter(w => w.length);
-  return { html: spanHTML(chunks), chunks };
+  return { html: stampSpans(html, chunks) || spanHTML(chunks), chunks };
 }
 
 // Real per-word timestamps only when they line up 1:1 with the chunk's rendered
@@ -137,13 +161,13 @@ class BatSpeakerSource {
 }
 
 // Mount a player into `root` for one turn and start it. Returns the ReadAlong
-// instance. opts: { session, turnId, text, whole, onDone }.
+// instance. opts: { session, turnId, text, html, whole, onDone }.
 window.mountReadAlong = function (root, opts) {
   const source = new BatSpeakerSource({
     session: opts.session, turnId: opts.turnId, whole: !!opts.whole,
   });
   const player = new ReadAlong(root, source, {
-    prepare: t => (opts.whole ? prepareOne(t) : prepareChunked(t)),
+    prepare: t => (opts.whole ? prepareOne(t, opts.html) : prepareChunked(t, opts.html)),
     getMd: () => false,
     compact: true,          // phone-first: one control line + speed stepper
     focus: true,            // fixed-gaze focus mode (◎; Bump / Still styles)
