@@ -6,3 +6,4 @@ __pycache__/
 data/
 .env
 .env.sh
+scripts/batspeaker_web/worker.bundle.js
