@@ -338,6 +338,7 @@ PAGE = r"""<!DOCTYPE html>
   .prov { border:1px solid var(--line); border-radius:.55rem; background:var(--panel2);
           margin:.4rem 0; }
   .prov.active { border-color:var(--acc); }
+  .prov.off { opacity:.5; }
   .prov > .head { display:flex; align-items:baseline; gap:.5rem; width:100%;
                   text-align:left; background:none; border:0; padding:.55rem .7rem; }
   .prov > .head .nm { font-weight:600; flex:0 0 auto; }
@@ -679,13 +680,17 @@ function renderProviders(){
     if(p.id==="local" && !localVoiceOK) continue;
     const row = document.createElement("div");
     row.className = "prov" + (p.id===act ? " active" : "");
+    const off = !!(cfg.unavailable||{})[p.id] && p.id!==act;
     const tag = p.id===act ? `<span class="tag">Active</span>`
+      : off ? `<span class="tag alt">Needs API key</span>`
       : (act==="local" && p.id===server ? `<span class="tag alt">Server default</span>` : "");
     const v = voiceFor(p.id);
     row.innerHTML = `<button class="head"><span class="nm">${escapeHtml(p.name)}</span>` +
       `<span class="what">${escapeHtml((v ? v+" · " : "") + p.note)}</span>${tag}</button>` +
       `<div class="opts"></div>`;
-    row.querySelector(".head").onclick = () => chooseProvider(p.id);
+    if(off) row.classList.add("off");
+    row.querySelector(".head").onclick = () => off
+      ? toast(`${p.name} needs an API key on the server`) : chooseProvider(p.id);
     const opts = row.querySelector(".opts");
     for(const o of p.opts){
       const lab = document.createElement("label"); lab.textContent = o.label; opts.appendChild(lab);
@@ -816,7 +821,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "elevenlabs_voice": cfg.get("elevenlabs_voice"),
                                     # on-device voice needs the reader's built
                                     # worker (synced, gitignored) to be present
-                                    "local_voice": os.path.isfile(LOCAL_WORKER)})
+                                    "local_voice": os.path.isfile(LOCAL_WORKER),
+                                    # providers whose key is missing can't be picked
+                                    "unavailable": {"kokoro-deepinfra": not core.get_env("DEEPINFRA_API_KEY")}})
         if path == "/silence.mp3":
             return self._send(200, get_silence(), ctype="audio/mpeg",
                               extra={"Cache-Control": "max-age=3600"})
