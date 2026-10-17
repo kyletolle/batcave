@@ -59,6 +59,42 @@ TOKEN = os.environ.get("TODOIST_API_TOKEN")
 BATCAVE_PROJECT = "Batcave"  # Default project for commands when --project is omitted.
 
 
+# --- Closed-pipe output ---
+#
+# `todoist list | head` closes the pipe early, and the next print raised
+# BrokenPipeError: a traceback, exit 120, and a false failure alert from the
+# telemetry wrapper. Worse, a bulk run piped to `head` would stop halfway
+# through its writes. When the reader hangs up, stdout now goes to /dev/null
+# and the command runs to the end, so every mutation still happens.
+
+class _QuietOnClosedPipe:
+    """Wraps stdout; on BrokenPipeError, points fd 1 at /dev/null and carries on."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except BrokenPipeError:
+            self._hush()
+            return len(data)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except BrokenPipeError:
+            self._hush()
+
+    def _hush(self):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, self._stream.fileno())
+        os.close(devnull)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def check_token():
     if not TOKEN:
         print("ERROR: TODOIST_API_TOKEN not found in environment.")
@@ -1541,6 +1577,7 @@ def cmd_remove_reminder(args):
 
 
 def main():
+    sys.stdout = _QuietOnClosedPipe(sys.stdout)
     parser = argparse.ArgumentParser(description="Todoist CLI for Bruce")
     sub = parser.add_subparsers(dest="command", required=True)
 
