@@ -475,6 +475,24 @@ DROPIN
   fi
 done
 
+# Netdata can take >10s to shut down. When unattended-upgrades restarted it after
+# a library update, the slow stop hit the default timeout, got SIGKILLed, and
+# paged as a failure even though it came straight back (2026-10-21).
+if [[ -f /etc/systemd/system/netdata.service.d/onfailure.conf ]]; then
+  cat >> /etc/systemd/system/netdata.service.d/onfailure.conf << 'DROPIN'
+
+[Service]
+TimeoutStopSec=60
+DROPIN
+  echo "  netdata stop timeout raised to 60s"
+fi
+
+# notify-failed-service.sh runs as ${USERNAME} and quotes the failed unit's log
+# in the page. Without this group it can't read system unit logs, and every
+# page from a system service says "-- No entries --" (2026-10-21).
+usermod -aG systemd-journal "$USERNAME"
+echo "  ${USERNAME} added to systemd-journal (pages include log lines)"
+
 systemctl daemon-reload
 echo "  failure alerting wired (ob-sync, earlyoom, netdata as present)."
 echo ""
