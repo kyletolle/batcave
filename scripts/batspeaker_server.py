@@ -485,6 +485,7 @@ function renderTabs(){
     b.className = "tab" + (s.id===active ? " active":"");
     b.innerHTML = `<span>${escapeHtml(s.title)}</span><span class="cnt">${s.turns}</span>` +
                   (s.listening ? `<span class="ear">🎧</span>`:"");
+    if(s.topic && s.topic !== s.title) b.title = s.topic;
     b.onclick = () => selectSession(s.id);
     el.appendChild(b);
   });
@@ -879,7 +880,8 @@ class Handler(BaseHTTPRequestHandler):
     def _sessions_payload(self):
         out = []
         for s in core.list_sessions():
-            out.append({"id": s["id"], "title": s["title"], "cwd": s["cwd"],
+            out.append({"id": s["id"], "title": s["title"], "topic": s["topic"],
+                        "cwd": s["cwd"],
                         "branch": s["branch"], "turns": s["turns"],
                         "last_ts": s["last_ts"], "listening": is_listening(s["id"])})
         return out
