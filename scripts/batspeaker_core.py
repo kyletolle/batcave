@@ -224,6 +224,7 @@ def _light_session_meta(path):
     """Cheap scan of a transcript for tab metadata, without building full turns.
     Returns dict or None if the file has no real turns."""
     title = None          # last aiTitle wins
+    name = None           # last customTitle wins (the session name, e.g. 2026-11-09:3)
     first_prompt = None
     cwd = None
     branch = None
@@ -242,6 +243,8 @@ def _light_session_meta(path):
                     continue
                 if e.get("aiTitle"):
                     title = e["aiTitle"]
+                if e.get("type") == "custom-title" and e.get("customTitle"):
+                    name = e["customTitle"]
                 if cwd is None and e.get("cwd"):
                     cwd = e["cwd"]
                 if branch is None and e.get("gitBranch"):
@@ -260,11 +263,15 @@ def _light_session_meta(path):
         return None
     if turn_count == 0:
         return None
-    label = title or _clean_label(first_prompt) or session_id[:8]
+    # The session name is the tab label when there is one: first-prompt labels
+    # are identical across every session that opens with the same command.
+    topic = title or _clean_label(first_prompt) or session_id[:8]
+    label = (name or "").strip()[:80] or topic
     return {
         "id": session_id,
         "path": path,
         "title": label,
+        "topic": topic,
         "cwd": cwd or "",
         "branch": branch or "",
         "turns": turn_count,
