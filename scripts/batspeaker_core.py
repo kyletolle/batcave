@@ -204,20 +204,44 @@ def turn_spoken_text(turn):
 
 # ---------- session discovery ----------
 
+def _command_line(text):
+    """A slash-command prompt arrives wrapped in XML (<command-name>,
+    <command-message>, <command-args>). Return it as typed, "/name args", or
+    None when the text is not a slash command."""
+    def tag(name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", text or "", flags=re.DOTALL)
+        return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+    name = tag("command-name") or tag("command-message")
+    if not name:
+        return None
+    if not name.startswith("/"):
+        name = "/" + name
+    args = tag("command-args")
+    return f"{name} {args}" if args else name
+
+
+def _cut(text, n):
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
 def _clean_label(text, n=80):
     """Turn a prompt into a readable label: unwrap slash-command XML, strip
     remaining tags, collapse whitespace, cut to n characters."""
     if not text:
         return ""
-    m = re.search(r"<command-name>\s*([^<]+?)\s*</command-name>", text)
-    if m:
-        return m.group(1).strip()[:n]
-    m = re.search(r"<command-message>\s*([^<]+?)\s*</command-message>", text)
-    if m:
-        return m.group(1).strip()[:n]
+    cmd = _command_line(text)
+    if cmd:
+        return _cut(cmd, n)
     text = re.sub(r"<[^>]+>", " ", text)            # drop any stray tags
     text = re.sub(r"\s+", " ", text).strip()
-    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+    return _cut(text, n)
+
+
+def prompt_caption(text, n=200):
+    """The question line on a turn card: a slash command reads as it was typed,
+    anything else is the prompt itself, whitespace collapsed (tags are kept —
+    in a real prompt they are the user's own text)."""
+    return _cut(_command_line(text) or re.sub(r"\s+", " ", text or "").strip(), n)
 
 
 def _light_session_meta(path):
@@ -324,7 +348,7 @@ def _letter_duplicate_names(metas):
 
 
 _RECAP_TAIL = re.compile(r"\s*\(disable recaps in /config\)\s*$")
-_NOT_A_PROMPT = {"/clear", "clear"}
+_NOT_A_PROMPT = {"/clear"}
 
 
 def session_recap(path):

@@ -133,7 +133,7 @@ def turn_payload(turn, with_html=True):
     p = {
         "id": turn["id"],
         "ts": turn.get("ts"),
-        "user": core.caption(turn.get("user", ""), 200),
+        "user": core.prompt_caption(turn.get("user", ""), 200),
         "has_audio": has_audio,
         "audio_url": f"audio/{turn['id']}.mp3" if has_audio else None,
     }
