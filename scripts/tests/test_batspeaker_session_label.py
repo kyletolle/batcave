@@ -115,3 +115,4 @@ def test_question_line_shows_a_slash_command_as_typed():
 def test_question_line_leaves_ordinary_prompts_alone():
     assert core.prompt_caption("why does  <div> break\nthe layout?") == "why does <div> break the layout?"
     assert core.prompt_caption("x" * 300, 200) == "x" * 199 + "…"
+    assert core.prompt_caption('<pasted_content id="ab12"> look at\nthis </pasted_content> please') == "look at this please"

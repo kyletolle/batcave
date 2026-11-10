@@ -239,9 +239,14 @@ def _clean_label(text, n=80):
 
 def prompt_caption(text, n=200):
     """The question line on a turn card: a slash command reads as it was typed,
-    anything else is the prompt itself, whitespace collapsed (tags are kept —
-    in a real prompt they are the user's own text)."""
-    return _cut(_command_line(text) or re.sub(r"\s+", " ", text or "").strip(), n)
+    anything else is the prompt itself, whitespace collapsed. The wrapper the
+    harness puts around pasted text is dropped; other tags are kept — in a real
+    prompt they are the user's own text."""
+    cmd = _command_line(text)
+    if cmd:
+        return _cut(cmd, n)
+    text = re.sub(r"</?pasted_content\b[^>]*>", " ", text or "")
+    return _cut(re.sub(r"\s+", " ", text).strip(), n)
 
 
 def _light_session_meta(path):
