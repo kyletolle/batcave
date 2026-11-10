@@ -17,6 +17,7 @@ Endpoints:
     GET  /                       the page
     GET  /sessions               JSON: list of conversations (tabs)
     GET  /session?id=&n=         JSON: last n turns of one conversation
+    GET  /recap?id=              JSON: recap + first/latest prompt of one conversation
     POST /tts   {session,turn}   synthesize one turn -> {url,duration}
     GET  /audio/<id>.mp3         cached turn audio (HTTP Range for iOS)
     GET  /events?session=        SSE: new turns for one conversation (+audio in listen mode)
@@ -354,6 +355,23 @@ PAGE = r"""<!DOCTYPE html>
   #panel select, #panel input[type=number] { width:100%; padding:.45rem; background:var(--panel2);
        color:var(--fg); border:1px solid var(--line); border-radius:.45rem; }
   .empty { color:var(--mut); text-align:center; margin-top:3rem; }
+  /* What this conversation is, at the very bottom of the thread — the place a
+     tab opens to. Not a .turn: nothing to speak, so no Speak row. The bottom
+     margin carries the safe-area inset #thread itself can't (see #thread). */
+  .recap { max-width:760px; margin:0 auto max(.8rem, env(safe-area-inset-bottom));
+           padding:.55rem .8rem; border:1px dashed var(--line); border-radius:.7rem;
+           font-size:.88rem; }
+  .recap .rl { color:var(--acc); font-size:.7rem; text-transform:uppercase;
+               letter-spacing:.4px; }
+  .recap .rl + .rt { margin-top:.1rem; }
+  .recap .rt + .rl { margin-top:.5rem; }
+  .recap .rt.mut { color:var(--mut); }
+  /* Jump to the bottom. Only shown once you're more than a screen up, and it
+     sits above the Speak button / player transport rather than on them. */
+  #toBottom { position:fixed; right:.8rem; z-index:5;
+              bottom:calc(3.4rem + env(safe-area-inset-bottom));
+              width:2.2rem; height:2.2rem; padding:0; border-radius:50%;
+              color:var(--acc); opacity:.9; box-shadow:0 2px 12px rgba(0,0,0,.6); }
   .toast { position:fixed; left:50%; bottom:2.5rem; transform:translateX(-50%);
            background:#2a2f3a; border:1px solid var(--line); padding:.5rem .8rem;
            border-radius:.5rem; opacity:0; transition:opacity .2s; pointer-events:none; }
@@ -430,6 +448,7 @@ PAGE = r"""<!DOCTYPE html>
   <button class="icon" id="menuBtn" title="Menu">☰</button>
 </header>
 <div id="thread"><div class="empty">Pick a conversation above.</div></div>
+<button id="toBottom" class="hidden" title="Jump to the bottom">↓</button>
 
 <div id="panel"><div class="card">
   <div class="brand"><span class="title">🔊 Bat-Speaker</span><span class="sub" id="now"></span></div>
@@ -486,7 +505,9 @@ function renderTabs(){
     b.innerHTML = `<span>${escapeHtml(s.title)}</span><span class="cnt">${s.turns}</span>` +
                   (s.listening ? `<span class="ear">🎧</span>`:"");
     if(s.topic && s.topic !== s.title) b.title = s.topic;
-    b.onclick = () => selectSession(s.id);
+    // Tapping the tab you're on is "take me to the bottom", without a reload
+    // (a reload would tear down a playing turn).
+    b.onclick = () => s.id===active ? jumpBottom() : selectSession(s.id);
     el.appendChild(b);
   });
 }
@@ -502,11 +523,53 @@ async function selectSession(id){
   const r = await fetch(`./session?id=${id}&n=20`);
   if(!r.ok){ thread.innerHTML = `<div class="empty">Couldn't load.</div>`; return; }
   const turns = await r.json();
-  thread.innerHTML = "";
+  if(active!==id) return;             // another tab was picked while this loaded
+  thread.innerHTML = ""; recapEl = null;
   if(!turns.length){ thread.innerHTML = `<div class="empty">No turns yet.</div>`; }
   turns.forEach(t => { seen.add(t.id); thread.appendChild(renderTurn(t)); });
   thread.scrollTop = thread.scrollHeight;
   openStream(id);
+  await loadRecap(id);
+  if(active===id) jumpBottom();
+}
+
+// ---- recap card + jump to bottom ----
+let recapEl = null;
+function jumpBottom(){ const th = $("#thread"); th.scrollTop = th.scrollHeight; syncJump(); }
+function syncJump(){
+  const th = $("#thread");
+  const up = th.scrollHeight - th.scrollTop - th.clientHeight;
+  $("#toBottom").classList.toggle("hidden", up <= th.clientHeight);
+}
+async function loadRecap(id){
+  try{
+    const r = await fetch(`./recap?id=${id}`); if(!r.ok) return;
+    const d = await r.json();
+    if(active===id) renderRecap(d);
+  }catch(e){}
+}
+function renderRecap(d){
+  const th = $("#thread");
+  const atBottom = th.scrollHeight - th.scrollTop - th.clientHeight < 80;
+  const part = (label, text, cls="") =>
+    `<div class="rl">${escapeHtml(label)}</div><div class="rt ${cls}">${escapeHtml(text)}</div>`;
+  let h = "";
+  if(d.recap){
+    const n = d.turns_since || 0;
+    h += part(`Recap · ${fmtTime(d.recap_ts)}` + (n ? ` · ${n} prompt${n===1?"":"s"} since` : ""), d.recap);
+    if(n && d.last_prompt) h += part("Latest prompt", d.last_prompt, "mut");
+  } else {
+    if(d.first_prompt) h += part("Started with", d.first_prompt);
+    if(d.last_prompt && d.last_prompt !== d.first_prompt) h += part("Latest prompt", d.last_prompt);
+  }
+  if(!h){ if(recapEl) recapEl.remove(); recapEl = null; return; }
+  if(!recapEl || !recapEl.isConnected){
+    recapEl = document.createElement("div"); recapEl.className = "recap";
+    th.appendChild(recapEl);
+  }
+  recapEl.innerHTML = h;
+  if(atBottom) th.scrollTop = th.scrollHeight;
+  syncJump();
 }
 
 function renderTurn(t){
@@ -580,8 +643,10 @@ function openStream(id){
     const card = renderTurn(t);
     const thread = $("#thread");
     const atBottom = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
-    thread.appendChild(card);
+    // New turns go above the recap card, which stays last.
+    thread.insertBefore(card, recapEl && recapEl.isConnected ? recapEl : null);
     if(atBottom) thread.scrollTop = thread.scrollHeight;
+    loadRecap(id);                      // "latest prompt" / "N since" just changed
     if(t.audio_url){ enqueue(card); }   // listen mode: server pre-synthed it
   };
   // The menu button doubles as the connection lamp — see the header comment.
@@ -599,6 +664,9 @@ function pump(){
   // Mount + play this turn; chain to the next when its player reports "done".
   mountPlayer(card, {onDone:()=>{ playing=false; pump(); }});
 }
+
+$("#toBottom").onclick = jumpBottom;
+$("#thread").addEventListener("scroll", syncJump, {passive:true});
 
 // ---- iOS autoplay unlock ----
 $("#startBtn").onclick = async () => {
@@ -808,6 +876,12 @@ class Handler(BaseHTTPRequestHandler):
             if turns is None:
                 return self._json(404, {"error": "unknown session"})
             return self._json(200, turns)
+        if path == "/recap":
+            sid = (self._query().get("id") or [""])[0]
+            spath = core.session_path(sid)
+            if not spath:
+                return self._json(404, {"error": "unknown session"})
+            return self._json(200, core.session_recap(spath))
         if path == "/config":
             cfg = core.load_config()
             return self._json(200, {"engine": cfg.get("engine"), "voice": cfg.get("voice"),

@@ -204,20 +204,20 @@ def turn_spoken_text(turn):
 
 # ---------- session discovery ----------
 
-def _clean_label(text):
-    """Turn a first-prompt into a readable tab label: unwrap slash-command XML,
-    strip remaining tags, collapse whitespace."""
+def _clean_label(text, n=80):
+    """Turn a prompt into a readable label: unwrap slash-command XML, strip
+    remaining tags, collapse whitespace, cut to n characters."""
     if not text:
         return ""
     m = re.search(r"<command-name>\s*([^<]+?)\s*</command-name>", text)
     if m:
-        return m.group(1).strip()[:80]
+        return m.group(1).strip()[:n]
     m = re.search(r"<command-message>\s*([^<]+?)\s*</command-message>", text)
     if m:
-        return m.group(1).strip()[:80]
+        return m.group(1).strip()[:n]
     text = re.sub(r"<[^>]+>", " ", text)            # drop any stray tags
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:80]
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
 def _light_session_meta(path):
@@ -229,6 +229,7 @@ def _light_session_meta(path):
     cwd = None
     branch = None
     turn_count = 0
+    first_ts = None
     last_ts = None
     session_id = os.path.splitext(os.path.basename(path))[0]
     try:
@@ -251,6 +252,8 @@ def _light_session_meta(path):
                     branch = e["gitBranch"]
                 if e.get("sessionId"):
                     session_id = e["sessionId"]
+                if first_ts is None and e.get("timestamp"):
+                    first_ts = e["timestamp"]
                 if is_real_user(e):
                     turn_count += 1
                     if first_prompt is None:
@@ -272,6 +275,8 @@ def _light_session_meta(path):
         "path": path,
         "title": label,
         "topic": topic,
+        "named": label != topic,
+        "first_ts": first_ts,
         "cwd": cwd or "",
         "branch": branch or "",
         "turns": turn_count,
@@ -298,7 +303,70 @@ def list_sessions(active_within_hours=48, limit=40):
     # Order by the last real conversation message, not file mtime — transcripts
     # get touched by non-turn writes (titles, summaries), which made tabs drift.
     metas.sort(key=lambda m: (m["last_ts"] or "", m["mtime"]), reverse=True)
+    _letter_duplicate_names(metas)
     return metas[:limit]
+
+
+def _letter_duplicate_names(metas):
+    """Transcripts can share a session name: /clear starts a new transcript
+    under the old name. Keep the earliest as-is and letter the later ones
+    (name, name b, name c) so their tabs can be told apart. Display only."""
+    groups = {}
+    for m in metas:
+        if m.get("named"):
+            groups.setdefault(m["title"], []).append(m)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda m: (m.get("first_ts") or "", m["mtime"]))
+        for i, m in enumerate(group[1:], start=1):
+            m["title"] += chr(ord("a") + i) if i < 26 else f"-{i + 1}"
+
+
+_RECAP_TAIL = re.compile(r"\s*\(disable recaps in /config\)\s*$")
+_NOT_A_PROMPT = {"/clear", "clear"}
+
+
+def session_recap(path):
+    """What a conversation is about, from what the transcript already holds —
+    no model call. Claude Code writes a recap (an `away_summary` entry) when a
+    session is returned to after sitting idle; the latest one wins, with a count
+    of the prompts sent since so a stale recap reads as stale. The first and
+    latest prompts ride along as the fallback for sessions with no recap."""
+    recap = recap_ts = first = last = None
+    since = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                if e.get("type") == "system" and e.get("subtype") == "away_summary":
+                    text = e.get("content")
+                    if isinstance(text, str) and text.strip():
+                        recap = _RECAP_TAIL.sub("", text.strip())
+                        recap_ts = e.get("timestamp")
+                        since = 0
+                elif is_real_user(e):
+                    raw = _user_text(e)
+                    if "<local-command-stdout>" in raw:
+                        continue            # a command's output, not a prompt
+                    text = _clean_label(raw, 220)
+                    if not text or text in _NOT_A_PROMPT:
+                        continue
+                    since += 1
+                    if first is None:
+                        first = text
+                    last = text
+    except OSError:
+        pass
+    return {"recap": recap, "recap_ts": recap_ts,
+            "turns_since": since if recap else 0,
+            "first_prompt": first, "last_prompt": last}
 
 
 def session_path(session_id):
