@@ -99,3 +99,20 @@ def test_recap_falls_back_to_prompts(tmp_path):
     assert r["recap"] is None and r["turns_since"] == 0
     assert r["first_prompt"] == "/start-boabw"              # /clear is not a prompt
     assert len(r["last_prompt"]) == 220 and r["last_prompt"].endswith("…")
+
+
+def test_question_line_shows_a_slash_command_as_typed():
+    wrapped = ("<command-message>sleep-morning</command-message>\n"
+               "<command-name>/sleep-morning</command-name>\n"
+               "<command-args>up at 07:40</command-args>")
+    assert core.prompt_caption(wrapped) == "/sleep-morning up at 07:40"
+    assert core.prompt_caption("<command-name>/clear</command-name>\n  "
+                               "<command-message>clear</command-message>\n  "
+                               "<command-args></command-args>") == "/clear"
+    assert core.prompt_caption("<command-message>wrap</command-message>") == "/wrap"
+
+
+def test_question_line_leaves_ordinary_prompts_alone():
+    assert core.prompt_caption("why does  <div> break\nthe layout?") == "why does <div> break the layout?"
+    assert core.prompt_caption("x" * 300, 200) == "x" * 199 + "…"
+    assert core.prompt_caption('<pasted_content id="ab12"> look at\nthis </pasted_content> please') == "look at this please"
