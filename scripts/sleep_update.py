@@ -37,6 +37,12 @@ Examples:
 
 By default, refuses to overwrite a field that already has content. Use --force
 to overwrite. Use --show to read current values without writing.
+
+Duplicate guard: if any day header (e.g. "- Monday [[2026-11-16]]") appears
+more than once in the weekly note, the note has almost certainly been welded
+by an Obsidian Sync conflict merge. Writes are refused with exit code 3 and a
+report of the duplicated days and their line numbers; --show still prints but
+also warns and exits 3. Dedupe the note, then rerun.
 """
 
 import os
@@ -78,6 +84,38 @@ def resolve_date(s):
 def weekly_note_path(d):
     iso_year, iso_week, _ = d.isocalendar()
     return os.path.join(WEEKLY_DIR, f"{iso_year}-W{iso_week:02d}.md")
+
+
+DAY_HEADER_RE = re.compile(
+    r"^\s*- (Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday) "
+    r"\[\[(\d{4}-\d{2}-\d{2})\]\]\s*$"
+)
+EXIT_DUPLICATES = 3
+
+
+def find_duplicate_days(lines):
+    """
+    Return {date_str: [line_numbers]} (1-indexed) for every day header that
+    appears more than once. Empty dict means the tracker is clean.
+    """
+    seen = {}
+    for i, line in enumerate(lines):
+        m = DAY_HEADER_RE.match(line)
+        if m:
+            seen.setdefault(m.group(2), []).append(i + 1)
+    return {d: nums for d, nums in seen.items() if len(nums) > 1}
+
+
+def duplicate_report(note_path, dupes):
+    """Human/agent-readable explanation of a duplicate-day refusal."""
+    out = [f"Duplicate day blocks in {os.path.basename(note_path)} "
+           f"(likely an Obsidian Sync merge weld):"]
+    for d in sorted(dupes):
+        out.append(f"  {d}: lines {', '.join(map(str, dupes[d]))}")
+    out.append("Nothing was written. Fix: diff the duplicate copies against each other,")
+    out.append("keep the complete one (not always the first), and look for a line that")
+    out.append("runs mid-sentence into a fragment of another line (the seam). Then rerun.")
+    return "\n".join(out)
 
 
 def find_day_block(lines, target_date):
@@ -162,6 +200,8 @@ def main():
     with open(note_path) as f:
         lines = f.readlines()
 
+    dupes = find_duplicate_days(lines)
+
     start, end = find_day_block(lines, target)
     if start is None:
         print(f"Error: no entry for {target.isoformat()} in {os.path.basename(note_path)}",
@@ -176,7 +216,14 @@ def main():
                 continue
             current = field_current_value(lines[idx], label)
             print(f"  {flag:<12} {current!r}")
+        if dupes:
+            print(duplicate_report(note_path, dupes), file=sys.stderr)
+            sys.exit(EXIT_DUPLICATES)
         return
+
+    if dupes:
+        print(duplicate_report(note_path, dupes), file=sys.stderr)
+        sys.exit(EXIT_DUPLICATES)
 
     # Collect updates. None = flag not passed; "" = explicit clear (allowed with --force).
     updates = [(flag, label, getattr(args, flag)) for flag, label in FIELDS if getattr(args, flag) is not None]

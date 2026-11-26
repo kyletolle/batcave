@@ -304,3 +304,74 @@ class TestCLI:
         r = run_cli(tmp_path, "--date", "today", "--energy", "7")
         assert r.returncode == 0, r.stderr
         assert "energy level today from 1 to 10: 7" in note.read_text()
+
+
+# ---- Duplicate-day guard (Sync merge welds) ----
+
+WELDED_NOTE = textwrap.dedent("""\
+    - Monday [[2026-04-13]]
+        - Night before, what time getting into bed: 22:00
+        - Hours of Sleep: ~8h
+    - Tuesday [[2026-04-14]]
+        - Night before, what time getting into bed: 23:00 4-6. Low energy
+        - Hours of Sleep:
+    - Monday [[2026-04-13]]
+        - Night before, what time getting into bed: 22:00
+        - Hours of Sleep: ~8h
+    - Tuesday [[2026-04-14]]
+        - Night before, what time getting into bed: 23:00
+        - Hours of Sleep:
+""")
+
+
+class TestFindDuplicateDays:
+    def test_clean_note_has_none(self):
+        assert su.find_duplicate_days(SAMPLE_WEEKLY_NOTE.splitlines(True)) == {}
+
+    def test_reports_each_duplicated_day_with_line_numbers(self):
+        dupes = su.find_duplicate_days(WELDED_NOTE.splitlines(True))
+        assert dupes == {"2026-04-13": [1, 7], "2026-04-14": [4, 10]}
+
+    def test_ignores_prose_mentions_of_a_day_link(self):
+        lines = [
+            "- Monday [[2026-04-13]]\n",
+            "    - Night before, what time getting into bed: 22:00\n",
+            "- Monday [[2026-04-13]] was rough, see the daily note\n",
+        ]
+        assert su.find_duplicate_days(lines) == {}
+
+
+@pytest.fixture
+def welded_vault(tmp_path):
+    weekly_dir = tmp_path / "4 Time" / "Weekly Notes"
+    weekly_dir.mkdir(parents=True)
+    note = weekly_dir / "2026-W16.md"
+    note.write_text(WELDED_NOTE)
+    return tmp_path, note
+
+
+class TestDuplicateGuardCLI:
+    def test_write_refused_with_exit_3_and_file_untouched(self, welded_vault):
+        vault, note = welded_vault
+        r = run_cli(vault, "--date", "2026-04-14", "--hours", "~7h")
+        assert r.returncode == su.EXIT_DUPLICATES
+        assert "Duplicate day blocks" in r.stderr
+        assert "2026-04-14: lines 4, 10" in r.stderr
+        assert note.read_text() == WELDED_NOTE
+
+    def test_refuses_even_when_target_day_is_not_duplicated(self, tmp_path):
+        weekly_dir = tmp_path / "4 Time" / "Weekly Notes"
+        weekly_dir.mkdir(parents=True)
+        note = weekly_dir / "2026-W16.md"
+        content = WELDED_NOTE + "- Wednesday [[2026-04-15]]\n    - Hours of Sleep:\n"
+        note.write_text(content)
+        r = run_cli(tmp_path, "--date", "2026-04-15", "--hours", "~7h")
+        assert r.returncode == su.EXIT_DUPLICATES
+        assert note.read_text() == content
+
+    def test_show_still_prints_but_warns(self, welded_vault):
+        vault, _ = welded_vault
+        r = run_cli(vault, "--date", "2026-04-13", "--show")
+        assert r.returncode == su.EXIT_DUPLICATES
+        assert "'22:00'" in r.stdout
+        assert "Duplicate day blocks" in r.stderr
