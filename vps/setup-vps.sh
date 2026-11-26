@@ -444,7 +444,8 @@ echo ""
 
 # --- Step 16: failure alerting (moshi-notify@ template + OnFailure dropins) ---
 # When a critical unit fails, systemd fires moshi-notify@<unit>, which routes a
-# PagerDuty page via notify-failed-service.sh. Codified here so it survives a
+# Slack line (+ a `bruce` Todoist task if the unit stays down) via
+# notify-failed-service.sh. It never pages (2026-11-26). Codified here so it survives a
 # server migration. (This drifted once: the template was hand-placed on the box
 # and silently lost when notify-failed-service.sh moved into the repo during the
 # code reorg — found 2026-06-23, alerting had been dead for ~5 services.)
@@ -452,7 +453,7 @@ echo "[16/17] Wiring failure alerting (moshi-notify@ + OnFailure dropins)..."
 
 cat > /etc/systemd/system/moshi-notify@.service << UNIT
 [Unit]
-Description=PagerDuty alert for failed unit %i
+Description=Failed-unit notice (Slack + bruce task, no page) for %i
 
 [Service]
 Type=oneshot
@@ -478,13 +479,26 @@ done
 # Netdata can take >10s to shut down. When unattended-upgrades restarted it after
 # a library update, the slow stop hit the default timeout, got SIGKILLed, and
 # paged as a failure even though it came straight back (2026-10-21).
+#
+# 60s wasn't enough: on 2026-11-26 it hung the full minute and paged at 06:42.
+# netdata 1.43 sometimes never exits on SIGTERM at all. graceful-stop does the
+# SIGKILL itself inside ExecStop, and SuccessExitStatus=KILL makes that a clean
+# stop, so a routine restart can't trip OnFailure. Runtime crashes still do.
+install -o root -g root -m 0755 \
+  "/home/${USERNAME}/projects/batcave/vps/graceful-stop.sh" /usr/local/sbin/graceful-stop
 if [[ -f /etc/systemd/system/netdata.service.d/onfailure.conf ]]; then
-  cat >> /etc/systemd/system/netdata.service.d/onfailure.conf << 'DROPIN'
+  cat > /etc/systemd/system/netdata.service.d/onfailure.conf << 'DROPIN'
+[Unit]
+OnFailure=moshi-notify@%n.service
 
 [Service]
+ExecStop=/usr/local/sbin/graceful-stop $MAINPID 30
+SuccessExitStatus=KILL
 TimeoutStopSec=60
+Restart=on-abnormal
+RestartSec=2s
 DROPIN
-  echo "  netdata stop timeout raised to 60s"
+  echo "  netdata: graceful-stop (30s, then KILL counts as clean), restart on crash"
 fi
 
 # notify-failed-service.sh runs as ${USERNAME} and quotes the failed unit's log
